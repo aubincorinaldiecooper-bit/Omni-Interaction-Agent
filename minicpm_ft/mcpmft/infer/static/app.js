@@ -66,6 +66,11 @@ const outputAudioStateEl = document.getElementById('outputAudioState');
 let transport = null;
 let ws = null;
 let connectingWs = null;
+// Handed back at `ready`; lets a dropped socket re-bind to the same
+// Thinker instead of starting a new session.
+let duplexSessionId = null;
+let duplexResumeToken = null;
+let reconnectingDuplex = false;
 let capturePaused = false;
 let stopping = false;
 let sessionState = 'idle';
@@ -950,6 +955,8 @@ function handleServerEvent(message) {
   // Video handles its own control replies.
   if (window.GanderVideo?.handleServerEvent(message)) return;
   if (message.type === 'ready') {
+    duplexSessionId = message.session_id || duplexSessionId;
+    duplexResumeToken = message.resume_token || null;
     playbackGeneration = Number(message.generation_id) || 0;
     pendingBinaryAudio = null;
     assistantAudioFloorUnit = 0;
@@ -1166,11 +1173,15 @@ async function requestJson(path, options = {}) {
   return payload;
 }
 
-function connectWebSocket() {
+function connectWebSocket({ resume = false } = {}) {
   return new Promise((resolve, reject) => {
     const socketUrl = new URL(serviceUrl('ws/duplex'));
     socketUrl.protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     socketUrl.searchParams.set('client_id', browserClientId);
+    if (resume && duplexSessionId && duplexResumeToken) {
+      socketUrl.searchParams.set('session_id', duplexSessionId);
+      socketUrl.searchParams.set('resume_token', duplexResumeToken);
+    }
     const candidate = new WebSocket(socketUrl);
     connectingWs = candidate;
     candidate.binaryType = 'arraybuffer';
@@ -1286,7 +1297,7 @@ function connectWebSocket() {
       }
       if (ws !== candidate) return;
       finished = true;
-      void cleanupAfterClose(false, candidate, 'Idle');
+      void reconnectDuplex(candidate);
     };
   });
 }
@@ -1713,6 +1724,48 @@ async function waitForRuntimeRelease(timeoutMs = 60000) {
   return false;
 }
 
+const DUPLEX_RECONNECT_DELAYS_MS = [500, 1000, 2000, 5000];
+
+async function reconnectDuplex(deadSocket) {
+  // The socket went away on its own. The microphone and the screen share are
+  // both still live, and the runtime holds the session for a short window, so
+  // re-bind to it rather than tearing the page down and asking the user to
+  // start again.
+  if (ws !== deadSocket) return;
+  ws = null;
+  transport = null;
+  if (stopping || !duplexResumeToken || reconnectingDuplex) {
+    await cleanupAfterClose(false, deadSocket, 'Idle');
+    return;
+  }
+  reconnectingDuplex = true;
+  capturePaused = true;
+  setStatus('Reconnecting');
+  addEvent('Duplex connection lost; reconnecting');
+  try {
+    for (let attempt = 0; attempt < DUPLEX_RECONNECT_DELAYS_MS.length; attempt += 1) {
+      await new Promise((resolve) => window.setTimeout(
+        resolve, DUPLEX_RECONNECT_DELAYS_MS[attempt]
+      ));
+      if (stopping || sessionState === 'idle') break;
+      try {
+        await connectWebSocket({ resume: true });
+        capturePaused = false;
+        addEvent('Duplex reconnected');
+        // The share never stopped; only its channel has to be rebuilt.
+        await window.GanderVideo?.resumeTransport();
+        return;
+      } catch (error) {
+        addEvent(`Reconnect attempt ${attempt + 1} failed: ${error.message || error}`);
+      }
+    }
+    addEvent('Could not reconnect; ending the session');
+    await cleanupAfterClose(false, null, 'Idle');
+  } finally {
+    reconnectingDuplex = false;
+  }
+}
+
 async function cleanupAfterClose(forceClose, expectedWs = null, finalStatus = 'Idle') {
   if (expectedWs && ws && ws !== expectedWs) return;
   if (cleanupPromise) return cleanupPromise;
@@ -1750,6 +1803,8 @@ async function cleanupAfterClose(forceClose, expectedWs = null, finalStatus = 'I
     setStatus(finalStatus, finalStatus === 'Error' ? 'error' : 'idle');
     capturePaused = false;
     stopping = false;
+    duplexSessionId = null;
+    duplexResumeToken = null;
     setSessionState('idle');
   })();
 
