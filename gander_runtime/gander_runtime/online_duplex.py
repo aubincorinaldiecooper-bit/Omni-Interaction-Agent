@@ -8,6 +8,7 @@ import re
 import secrets
 import time
 import urllib.parse
+from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -1049,6 +1050,9 @@ def create_online_duplex_app(
         coordinator: Any | None = None
         active: _ActiveSession | None = None
         outbound_task: asyncio.Task[None] | None = None
+        warmup_task: asyncio.Task[None] | None = None
+        receive_watcher: asyncio.Task[dict[str, Any]] | None = None
+        pending_messages: deque[dict[str, Any]] = deque()
         speech_output_task: asyncio.Task[None] | None = None
         speech_output_stop: asyncio.Event | None = None
         pending_audio_header: AudioFrameHeader | None = None
@@ -1059,6 +1063,18 @@ def create_online_duplex_app(
         websocket_outbox = _WebSocketOutbox(
             websocket, runtime.settings.output_sample_rate
         )
+
+        async def receive_message() -> dict[str, Any]:
+            """Next client message, oldest first.
+
+            Anything the client sent while the session was still starting was
+            buffered by the startup watcher, and is delivered before the
+            socket is read again.
+            """
+
+            if pending_messages:
+                return pending_messages.popleft()
+            return await websocket.receive()
 
         async def send_text(
             payload: dict[str, Any],
@@ -1178,131 +1194,235 @@ def create_online_duplex_app(
                 close_ledger=True,
             )
             await task_coordinator.start()
-            await _warm_backbrain_providers(gateway)
+            # The Brain is warmed in the background once the client is ready;
+            # seeing and hearing must not wait on it.
             return task_coordinator
 
         try:
-            session = await _open_session(runtime)
-            if runtime.detached_talker is not None:
-                speech_output_stop, speech_output_task = start_speech_output_pump(
-                    session
-                )
-            active = _ActiveSession(
-                duplex=session,
-                screen_token=secrets.token_urlsafe(32),
-                codex_frame_gate=ScreenFrameRateGate(
-                    _codex_frame_interval_ms(runtime)
-                ),
-                media_mode=runtime.settings.media_mode,
-            )
-            runtime.sessions[session_id] = active
-            coordinator = await build_coordinator(session)
-            active.coordinator = coordinator
+            async def run_startup() -> None:
+                """Open the Thinker and announce readiness."""
 
-            async def forward_tool_outputs() -> None:
-                assert coordinator is not None
-                while True:
-                    output = await coordinator.next_output()
-                    if output.kind == "control":
-                        await send_text(
-                            output.value,
-                            wait_sent=output.delivery_id is not None,
-                        )
-                    else:
-                        await send_model_event(
-                            output.value,
-                            wait_sent=output.delivery_id is not None,
-                        )
-                    if output.delivery_id is not None:
-                        coordinator.acknowledge_output(output)
+                nonlocal session, active, coordinator
+                nonlocal outbound_task, warmup_task
+                nonlocal speech_output_stop, speech_output_task
 
-            outbound_task = asyncio.create_task(
-                forward_tool_outputs(),
-                name=f"gander-native-tool-output-{session_id}",
-            )
-            outbound_task.add_done_callback(
-                lambda task: (
-                    None
-                    if task.cancelled()
-                    else LOGGER.error(
-                        "native tool output loop failed for %s: %s",
-                        session_id,
-                        task.exception(),
+                session = await _open_session(runtime)
+                if runtime.detached_talker is not None:
+                    speech_output_stop, speech_output_task = start_speech_output_pump(
+                        session
                     )
-                    if task.exception() is not None
-                    else None
+                active = _ActiveSession(
+                    duplex=session,
+                    screen_token=secrets.token_urlsafe(32),
+                    codex_frame_gate=ScreenFrameRateGate(
+                        _codex_frame_interval_ms(runtime)
+                    ),
+                    media_mode=runtime.settings.media_mode,
                 )
-            )
-            screen_enabled = (
-                active.media_mode != "voice" or _client_video_allowed(runtime)
-            )
-            await send_text(
-                {
-                    "type": "ready",
-                    "session_id": session_id,
-                    "input_sample_rate": runtime.settings.input_sample_rate,
-                    "output_sample_rate": runtime.settings.output_sample_rate,
-                    "chunk_ms": runtime.params.chunk_ms,
-                    "audio_input": {
-                        "protocol": AUDIO_INPUT_PROTOCOL,
-                        "encoding": "pcm_s16le",
-                        "clock": "unix_ms",
-                    },
-                    "generate_audio": bool(
-                        runtime.params.generate_audio
-                        or runtime.detached_talker is not None
-                    ),
-                    "detached_talker": runtime.detached_talker is not None,
-                    "generation_id": int(
-                        session.talker_state().get("generation_id", 0)
-                    ),
-                    "sliding_window_mode": runtime.params.sliding_window_mode,
-                    "context_max_units": runtime.params.context_max_units,
-                    "context_previous_max_tokens": (
-                        runtime.params.context_previous_max_tokens
-                    ),
-                    "transport": "ws",
-                    "decode_mode": runtime.settings.decode_mode,
-                    "media_mode": active.media_mode,
-                    "video_source": active.video_source,
-                    "tool_protocol": "native_complete_call_v1",
-                    "task_protocol": ONLINE_TASK_PROTOCOL,
-                    "turn_bind_grace_ms": round(
-                        runtime.settings.turn_bind_grace_sec * 1000
-                    ),
-                    "tools": _tool_names(runtime),
-                    "context_events": [
-                        "turn.final",
-                        *(
-                            ["memory.episode"]
-                            if runtime.params.sliding_window_mode == "context_memory"
-                            else []
+                runtime.sessions[session_id] = active
+                coordinator = await build_coordinator(session)
+                active.coordinator = coordinator
+
+                async def forward_tool_outputs() -> None:
+                    assert coordinator is not None
+                    while True:
+                        output = await coordinator.next_output()
+                        if output.kind == "control":
+                            await send_text(
+                                output.value,
+                                wait_sent=output.delivery_id is not None,
+                            )
+                        else:
+                            await send_model_event(
+                                output.value,
+                                wait_sent=output.delivery_id is not None,
+                            )
+                        if output.delivery_id is not None:
+                            coordinator.acknowledge_output(output)
+
+                outbound_task = asyncio.create_task(
+                    forward_tool_outputs(),
+                    name=f"gander-native-tool-output-{session_id}",
+                )
+                outbound_task.add_done_callback(
+                    lambda task: (
+                        None
+                        if task.cancelled()
+                        else LOGGER.error(
+                            "native tool output loop failed for %s: %s",
+                            session_id,
+                            task.exception(),
+                        )
+                        if task.exception() is not None
+                        else None
+                    )
+                )
+                screen_enabled = (
+                    active.media_mode != "voice" or _client_video_allowed(runtime)
+                )
+                await send_text(
+                    {
+                        "type": "ready",
+                        "session_id": session_id,
+                        "input_sample_rate": runtime.settings.input_sample_rate,
+                        "output_sample_rate": runtime.settings.output_sample_rate,
+                        "chunk_ms": runtime.params.chunk_ms,
+                        "audio_input": {
+                            "protocol": AUDIO_INPUT_PROTOCOL,
+                            "encoding": "pcm_s16le",
+                            "clock": "unix_ms",
+                        },
+                        "generate_audio": bool(
+                            runtime.params.generate_audio
+                            or runtime.detached_talker is not None
                         ),
-                        "task_status",
-                        "screen",
-                    ],
-                    "screen": {
-                        "enabled": screen_enabled,
-                        "path": "/ws/screen" if screen_enabled else None,
-                        "token": active.screen_token if screen_enabled else None,
-                        "protocol": "metadata-json+encoded-binary-v1",
-                        "encodings": ["jpeg", "webp", "png"],
-                        "max_frame_bytes": runtime.settings.max_screen_frame_bytes,
-                        "max_pixels": runtime.settings.max_screen_pixels,
-                        "vision_max_slice_nums": runtime.settings.vision_max_slice_nums,
-                        "vision_batch_feed": runtime.settings.vision_batch_feed,
-                        "recommended_frame_rate": _unit_frame_rate(runtime),
-                        "codex_frame_rate": _codex_frame_rate(runtime),
-                        "codex_screen_history_seconds": (
-                            runtime.settings.codex_screen_history_seconds
+                        "detached_talker": runtime.detached_talker is not None,
+                        "generation_id": int(
+                            session.talker_state().get("generation_id", 0)
                         ),
-                        "client_video": _client_video_capabilities(runtime),
-                    },
-                }
+                        "sliding_window_mode": runtime.params.sliding_window_mode,
+                        "context_max_units": runtime.params.context_max_units,
+                        "context_previous_max_tokens": (
+                            runtime.params.context_previous_max_tokens
+                        ),
+                        "transport": "ws",
+                        "decode_mode": runtime.settings.decode_mode,
+                        "media_mode": active.media_mode,
+                        "video_source": active.video_source,
+                        "tool_protocol": "native_complete_call_v1",
+                        "task_protocol": ONLINE_TASK_PROTOCOL,
+                        "turn_bind_grace_ms": round(
+                            runtime.settings.turn_bind_grace_sec * 1000
+                        ),
+                        "tools": _tool_names(runtime),
+                        "context_events": [
+                            "turn.final",
+                            *(
+                                ["memory.episode"]
+                                if runtime.params.sliding_window_mode == "context_memory"
+                                else []
+                            ),
+                            "task_status",
+                            "screen",
+                        ],
+                        "screen": {
+                            "enabled": screen_enabled,
+                            "path": "/ws/screen" if screen_enabled else None,
+                            "token": active.screen_token if screen_enabled else None,
+                            "protocol": "metadata-json+encoded-binary-v1",
+                            "encodings": ["jpeg", "webp", "png"],
+                            "max_frame_bytes": runtime.settings.max_screen_frame_bytes,
+                            "max_pixels": runtime.settings.max_screen_pixels,
+                            "vision_max_slice_nums": runtime.settings.vision_max_slice_nums,
+                            "vision_batch_feed": runtime.settings.vision_batch_feed,
+                            "recommended_frame_rate": _unit_frame_rate(runtime),
+                            "codex_frame_rate": _codex_frame_rate(runtime),
+                            "codex_screen_history_seconds": (
+                                runtime.settings.codex_screen_history_seconds
+                            ),
+                            "client_video": _client_video_capabilities(runtime),
+                        },
+                    }
+                )
+
+                async def warm_back_brain() -> None:
+                    """Warm the Brain behind the session that is already running.
+
+                    Gander is perceptually ready before this finishes. A delegated
+                    task that arrives first is not dropped: the provider's worker
+                    start is guarded by its own lock, so the task waits for the
+                    same warm-up rather than starting a second one.
+                    """
+
+                    try:
+                        await send_text({"type": "brain.status", "status": "warming"})
+                        await _warm_backbrain_providers(coordinator.gateway)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        # An unreachable or cold Brain costs delegated work, not
+                        # the session: Gander can still see, hear and answer.
+                        LOGGER.warning(
+                            "back brain warmup failed for %s: %s", session_id, exc
+                        )
+                        try:
+                            await send_text(
+                                {
+                                    "type": "brain.status",
+                                    "status": "error",
+                                    "message": str(exc),
+                                }
+                            )
+                        except Exception:
+                            LOGGER.debug(
+                                "could not report brain warmup failure for %s",
+                                session_id,
+                                exc_info=True,
+                            )
+                    else:
+                        try:
+                            await send_text(
+                                {"type": "brain.status", "status": "ready"}
+                            )
+                        except Exception:
+                            LOGGER.debug(
+                                "could not report brain readiness for %s",
+                                session_id,
+                                exc_info=True,
+                            )
+
+                warmup_task = asyncio.create_task(
+                    warm_back_brain(), name=f"gander-brain-warmup-{session_id}"
+                )
+
+            # Watch the socket while the session starts. A client that
+            # gives up during the model open must free the Thinker slot
+            # now, not whenever startup happens to finish.
+            receive_watcher = asyncio.create_task(
+                websocket.receive(),
+                name=f"gander-duplex-receive-{session_id}",
             )
+            startup = asyncio.create_task(
+                run_startup(), name=f"gander-duplex-startup-{session_id}"
+            )
+            try:
+                while not startup.done():
+                    await asyncio.wait(
+                        {startup, receive_watcher},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if not receive_watcher.done():
+                        continue
+                    early = receive_watcher.result()
+                    if early.get("type") == "websocket.disconnect":
+                        raise WebSocketDisconnect(code=1006)
+                    # Anything the client sent while we were starting is
+                    # kept in order for the main loop below.
+                    pending_messages.append(early)
+                    receive_watcher = asyncio.create_task(
+                        websocket.receive(),
+                        name=f"gander-duplex-receive-{session_id}",
+                    )
+            finally:
+                if not startup.done():
+                    startup.cancel()
+                    await asyncio.gather(startup, return_exceptions=True)
+                if receive_watcher is not None:
+                    # Hand the socket back to the main loop. Cancelling a
+                    # receive that has not produced anything consumes nothing,
+                    # and a message that landed in the meantime is kept.
+                    receive_watcher.cancel()
+                    await asyncio.gather(receive_watcher, return_exceptions=True)
+                    if not receive_watcher.cancelled():
+                        if receive_watcher.exception() is None:
+                            pending_messages.append(receive_watcher.result())
+                    receive_watcher = None
+            # Surface anything startup itself raised.
+            await startup
+
 
             while True:
-                message = await websocket.receive()
+                message = await receive_message()
                 if message.get("type") == "websocket.disconnect":
                     return
                 if message.get("bytes") is not None:
@@ -1602,6 +1722,9 @@ def create_online_duplex_app(
                     except RuntimeError:
                         pass
                 await stop_speech_output_pump()
+                if warmup_task is not None:
+                    warmup_task.cancel()
+                    await asyncio.gather(warmup_task, return_exceptions=True)
                 if outbound_task is not None:
                     outbound_task.cancel()
                     await asyncio.gather(outbound_task, return_exceptions=True)
