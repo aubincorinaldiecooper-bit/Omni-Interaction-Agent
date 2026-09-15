@@ -41,6 +41,9 @@ from .task_tools_online import TaskToolsRealtimeCoordinator
 LOGGER = logging.getLogger(__name__)
 _SESSION_ID = re.compile(r"^(?!\.{1,2}$)[A-Za-z0-9_.-]{1,128}$")
 ONLINE_TASK_PROTOCOL = "task_tools_v1"
+# Longest we wait for the talker to finish draining before cancelling it.
+# Teardown holds the single model slot, so it must be bounded.
+SPEECH_PUMP_DRAIN_TIMEOUT_SEC = 5.0
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 
@@ -907,78 +910,98 @@ def create_online_duplex_app(
                     return
                 if metadata_message.get("type") == "websocket.disconnect":
                     return
-                raw_metadata = metadata_message.get("text")
-                if raw_metadata is None:
-                    raise ValueError("screen frame metadata must be JSON text")
-                payload = json.loads(raw_metadata)
-                if not isinstance(payload, dict):
-                    raise ValueError("screen frame metadata must be an object")
-                header = ScreenFrameHeader.from_payload(payload)
+                frame_id: Any = None
+                try:
+                    raw_metadata = metadata_message.get("text")
+                    if raw_metadata is None:
+                        raise ValueError("screen frame metadata must be JSON text")
+                    payload = json.loads(raw_metadata)
+                    if not isinstance(payload, dict):
+                        raise ValueError("screen frame metadata must be an object")
+                    header = ScreenFrameHeader.from_payload(payload)
+                    frame_id = header.frame_id
 
-                image_message = await receive_while_session_active()
-                if image_message is None:
-                    return
-                if image_message.get("type") == "websocket.disconnect":
-                    return
-                image_payload = image_message.get("bytes")
-                if image_payload is None:
-                    raise ValueError("screen frame image must be binary")
-                decoded = await asyncio.to_thread(
-                    decode_screen_frame,
-                    header,
-                    image_payload,
-                    max_bytes=runtime.settings.max_screen_frame_bytes,
-                    max_pixels=runtime.settings.max_screen_pixels,
-                )
-                if runtime.sessions.get(session_id) is not active:
-                    return
-                if active.media_mode == "voice":
-                    # Ignore a frame completed after the session returned to audio mode.
+                    image_message = await receive_while_session_active()
+                    if image_message is None:
+                        return
+                    if image_message.get("type") == "websocket.disconnect":
+                        return
+                    image_payload = image_message.get("bytes")
+                    if image_payload is None:
+                        raise ValueError("screen frame image must be binary")
+                    decoded = await asyncio.to_thread(
+                        decode_screen_frame,
+                        header,
+                        image_payload,
+                        max_bytes=runtime.settings.max_screen_frame_bytes,
+                        max_pixels=runtime.settings.max_screen_pixels,
+                    )
+                    if runtime.sessions.get(session_id) is not active:
+                        return
+                    if active.media_mode == "voice":
+                        # Ignore a frame completed after the session returned to audio mode.
+                        await websocket.send_text(
+                            _json(
+                                {
+                                    "type": "screen.frame.dropped",
+                                    "frame_id": header.frame_id,
+                                    "reason": "media_mode is voice",
+                                }
+                            )
+                        )
+                        continue
+
+                    context_sampled = active.codex_frame_gate.accept(
+                        header.captured_at_ms
+                    )
+                    # Publish to the front brain before ACK; persist off the event loop.
+                    active.duplex.enqueue_screen_frame(decoded.frame)
+                    await websocket.send_text(
+                        _json(
+                            {
+                                "type": "screen.frame.accepted",
+                                "frame_id": header.frame_id,
+                                "captured_at_ms": header.captured_at_ms,
+                                "width": decoded.width,
+                                "height": decoded.height,
+                                "asset_id": decoded.asset_id,
+                                "context_sampled": context_sampled,
+                            }
+                        )
+                    )
+                    if context_sampled:
+                        # Tag webcam and screen frames separately for back-brain context.
+                        source = header.video_source or active.video_source
+                        media = await _screen_media_ref(
+                            runtime,
+                            session_id,
+                            header,
+                            image_payload,
+                            decoded,
+                            kind="frame" if source == "camera" else "screen",
+                        )
+                        if runtime.sessions.get(session_id) is not active:
+                            return
+                        coordinator = active.coordinator
+                        if coordinator is not None:
+                            coordinator.remember_media(media)
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    # One malformed or undecodable frame is not a reason to end
+                    # the screen channel. The capture is still good and the next
+                    # frame usually is too, so report the drop and keep going.
+                    LOGGER.warning(
+                        "dropping screen frame for %s: %s", session_id, exc
+                    )
                     await websocket.send_text(
                         _json(
                             {
                                 "type": "screen.frame.dropped",
-                                "frame_id": header.frame_id,
-                                "reason": "media_mode is voice",
+                                "frame_id": frame_id,
+                                "reason": str(exc),
                             }
                         )
                     )
                     continue
-
-                context_sampled = active.codex_frame_gate.accept(
-                    header.captured_at_ms
-                )
-                # Publish to the front brain before ACK; persist off the event loop.
-                active.duplex.enqueue_screen_frame(decoded.frame)
-                await websocket.send_text(
-                    _json(
-                        {
-                            "type": "screen.frame.accepted",
-                            "frame_id": header.frame_id,
-                            "captured_at_ms": header.captured_at_ms,
-                            "width": decoded.width,
-                            "height": decoded.height,
-                            "asset_id": decoded.asset_id,
-                            "context_sampled": context_sampled,
-                        }
-                    )
-                )
-                if context_sampled:
-                    # Tag webcam and screen frames separately for back-brain context.
-                    source = header.video_source or active.video_source
-                    media = await _screen_media_ref(
-                        runtime,
-                        session_id,
-                        header,
-                        image_payload,
-                        decoded,
-                        kind="frame" if source == "camera" else "screen",
-                    )
-                    if runtime.sessions.get(session_id) is not active:
-                        return
-                    coordinator = active.coordinator
-                    if coordinator is not None:
-                        coordinator.remember_media(media)
         except WebSocketDisconnect:
             return
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -996,12 +1019,27 @@ def create_online_duplex_app(
         requested_id = websocket.query_params.get("session_id")
         session_id = requested_id or f"duplex_{secrets.token_hex(8)}"
         if not _SESSION_ID.fullmatch(session_id):
-            await websocket.send_text(_json({"type": "error", "message": "invalid session_id"}))
+            await websocket.send_text(
+                _json(
+                    {
+                        "type": "error",
+                        "message": "invalid session_id",
+                        "fatal": True,
+                    }
+                )
+            )
             await websocket.close(code=1008)
             return
         if runtime.model_lock.locked():
             await websocket.send_text(
-                _json({"type": "error", "message": "model is busy with another session"})
+                _json(
+                    {
+                        "type": "error",
+                        "message": "model is busy with another session",
+                        "fatal": False,
+                        "retry": True,
+                    }
+                )
             )
             await websocket.close(code=1013)
             return
@@ -1027,6 +1065,11 @@ def create_online_duplex_app(
             *,
             wait_sent: bool = False,
         ) -> None:
+            if payload.get("type") == "error" and "fatal" not in payload:
+                # Control-parsing and validation errors leave the Thinker
+                # usable, so they must not end the client's session. Only a
+                # caller that knows otherwise sets fatal=True.
+                payload = {**payload, "fatal": False}
             await websocket_outbox.send_text(payload, wait_sent=wait_sent)
 
         async def send_model_event(
@@ -1050,7 +1093,11 @@ def create_online_duplex_app(
                             audio=type(event).__name__
                             in {"SpeechSynthesisChunk", "SpeechSynthesisDone"},
                         )
-                        continue
+                        if not stop.is_set():
+                            continue
+                        # Stop arrived mid-stream. Fall through to drain what
+                        # is already buffered rather than following the model
+                        # for as long as it keeps producing.
                     if stop.is_set():
                         for remaining in target.drain_outputs():
                             await websocket_outbox.send_event(
@@ -1073,11 +1120,30 @@ def create_online_duplex_app(
             nonlocal speech_output_task, speech_output_stop
             if speech_output_stop is not None:
                 speech_output_stop.set()
-            if speech_output_task is not None:
+            task = speech_output_task
+            if task is not None:
                 try:
-                    await speech_output_task
-                except (WebSocketDisconnect, RuntimeError):
-                    pass
+                    await asyncio.wait_for(
+                        asyncio.shield(task), SPEECH_PUMP_DRAIN_TIMEOUT_SEC
+                    )
+                except asyncio.TimeoutError:
+                    LOGGER.warning(
+                        "speech output pump for %s did not drain in %.1fs; "
+                        "cancelling",
+                        session_id,
+                        SPEECH_PUMP_DRAIN_TIMEOUT_SEC,
+                    )
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+                except Exception:
+                    # The pump re-raises whatever the websocket writer stored,
+                    # which is any exception type at all. Teardown must not
+                    # depend on which one it is.
+                    LOGGER.debug(
+                        "speech output pump for %s ended in error",
+                        session_id,
+                        exc_info=True,
+                    )
             speech_output_task = None
             speech_output_stop = None
 
@@ -1506,34 +1572,75 @@ def create_online_duplex_app(
         except Exception as exc:
             LOGGER.exception("duplex websocket failed: %s", session_id)
             try:
-                await send_text({"type": "error", "message": str(exc)})
+                await send_text(
+                    {"type": "error", "message": str(exc), "fatal": True}
+                )
                 await websocket_outbox.join()
             except (RuntimeError, WebSocketDisconnect):
                 pass
         finally:
-            if (
-                runtime.detached_talker is not None
-                and session is not None
-                and not session.closed
-            ):
+            slot_released = False
+
+            def release_model_slot() -> None:
+                """Free the single Thinker slot, exactly once."""
+
+                nonlocal slot_released
+                if slot_released:
+                    return
+                slot_released = True
+                runtime.model_lock.release()
+                LOGGER.info("released model slot for %s", session_id)
+
+            try:
+                if (
+                    runtime.detached_talker is not None
+                    and session is not None
+                    and not session.closed
+                ):
+                    try:
+                        await asyncio.to_thread(session.interrupt_output)
+                    except RuntimeError:
+                        pass
+                await stop_speech_output_pump()
+                if outbound_task is not None:
+                    outbound_task.cancel()
+                    await asyncio.gather(outbound_task, return_exceptions=True)
+                await websocket_outbox.close()
+                if active is not None:
+                    if runtime.sessions.get(session_id) is active:
+                        runtime.sessions.pop(session_id, None)
+                    active.ended.set()
+                if coordinator is not None:
+                    # Everything that touches the Thinker stops here. The
+                    # gateway's own teardown waits until the slot is free.
+                    await coordinator.stop_model_jobs()
+            except Exception:
+                LOGGER.warning(
+                    "teardown before slot release failed for %s",
+                    session_id,
+                    exc_info=True,
+                )
+            finally:
+                # However the block above ended - cleanly, in error, or
+                # cancelled - the Thinker is closed and the slot is freed.
+                # Neither call suspends, so nothing can land between them.
                 try:
-                    await asyncio.to_thread(session.interrupt_output)
-                except RuntimeError:
-                    pass
-            await stop_speech_output_pump()
-            if outbound_task is not None:
-                outbound_task.cancel()
-                await asyncio.gather(outbound_task, return_exceptions=True)
-            await websocket_outbox.close()
-            if active is not None:
-                if runtime.sessions.get(session_id) is active:
-                    runtime.sessions.pop(session_id, None)
-                active.ended.set()
+                    if session is not None and not session.closed:
+                        session.close()
+                finally:
+                    release_model_slot()
+
             if coordinator is not None:
-                await coordinator.close()
-            if session is not None and not session.closed:
-                # Model-owning coordinator jobs have stopped before close.
-                session.close()
-            runtime.model_lock.release()
+                # Worker/Ornith teardown is HTTP and can be slow. It runs with
+                # the slot already free, so Stop followed immediately by Start
+                # no longer reports the model busy.
+                try:
+                    await coordinator.close()
+                except Exception:
+                    LOGGER.warning(
+                        "worker gateway teardown failed for %s",
+                        session_id,
+                        exc_info=True,
+                    )
 
     return app
