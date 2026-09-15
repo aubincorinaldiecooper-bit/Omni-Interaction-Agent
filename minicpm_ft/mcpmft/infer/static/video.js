@@ -9,6 +9,9 @@
   const PREVIEW_HZ = 5;
   const MODE_ACK_TIMEOUT_MS = 5000;
   const FRAME_ACK_TIMEOUT_MS = 5000;
+  // Transport comes back on its own; capture is never reacquired to do it.
+  const RECONNECT_DELAYS_MS = [500, 1000, 2000, 5000];
+  const RECONNECT_BUDGET_MS = 60000;
   const STORAGE_KEY = 'minicpm-video-source';
 
   const control = document.getElementById('videoModeControl');
@@ -44,6 +47,13 @@
   let preacquired = null;
   let sessionState = 'idle';
   let lifecycleGeneration = 0;
+  // Capture and transport are separate state machines. Capture owns the
+  // MediaStream and is ended only by the user, the browser, or a failure to
+  // acquire it. Transport owns the socket and reconnects freely underneath.
+  let transportState = 'idle';
+  let reconnectTimer = null;
+  let reconnectAttempt = 0;
+  let reconnectDeadline = 0;
 
   class VideoSetupCancelledError extends Error {
     constructor() {
@@ -77,7 +87,15 @@
 
   function describe() {
     if (!activeSource) return 'Off';
+    if (transportState === 'connecting') return `${activeSource} · connecting`;
+    if (transportState === 'reconnecting') return `${activeSource} · reconnecting`;
+    if (transportState === 'lost') return `${activeSource} · sharing, not connected`;
     return `${activeSource} ${frameRate()} Hz`;
+  }
+
+  function setTransportState(next) {
+    transportState = next;
+    setState(describe());
   }
 
   function updateNote() {
@@ -134,6 +152,8 @@
     return source.play().catch(() => {});
   }
 
+  // Ends the operating system's "sharing your screen" state. Only
+  // stopCapture() may call this.
   function releaseStream() {
     if (track) track.removeEventListener('ended', onTrackEnded);
     if (stream) {
@@ -355,16 +375,17 @@
       candidate.onclose = () => {
         if (connectingSocket === candidate) connectingSocket = null;
         const wasActive = socket === candidate;
-        const awaitingFrame = pendingFrameAcks.size > 0;
         if (wasActive) socket = null;
         rejectPendingFrameAcks(
           new Error('Screen channel closed before frame acknowledgement')
         );
         if (settled) {
-          if (wasActive && !awaitingFrame && activeSource) {
-            report('Video channel closed unexpectedly');
-            revertSelect();
-            void disable();
+          if (wasActive && activeSource) {
+            // Transport only. The share stays up, the dropdown keeps the
+            // user's choice, and the same stream is used to reconnect.
+            report('Video channel closed; reconnecting');
+            detachTransport();
+            scheduleReconnect(activeSource);
           }
           return;
         }
@@ -431,49 +452,119 @@
     return settled;
   }
 
+  // Everything from mode negotiation to the first acknowledged frame. Safe to
+  // run again on a stream that is already captured: it never touches capture.
+  async function connectTransport(kind, generation) {
+    const done = await requestMode(true, kind, generation);
+    requireActiveLifecycle(generation);
+    const config = done.screen;
+    if (!config) throw new Error('Runtime did not offer a screen channel');
+    await openScreenSocket(
+      { ...config, session_id: done.session_id || sessionId() },
+      generation
+    );
+    requireActiveLifecycle(generation);
+    activeSource = kind;
+    framesSent = 0;
+    showPreview(true);
+    await sendInitialFrame(generation);
+    requireActiveLifecycle(generation);
+    startPacer();
+    cancelReconnect();
+    setTransportState('live');
+    updateNote();
+    return done;
+  }
+
+  // Closes the channel and stops sending. The MediaStream is left alone: a
+  // dropped socket must not make the browser's sharing indicator flicker.
+  function detachTransport() {
+    stopPacer();
+    closeScreenSocket();
+  }
+
+  function cancelReconnect() {
+    if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+    reconnectAttempt = 0;
+    reconnectDeadline = 0;
+  }
+
+  function scheduleReconnect(kind) {
+    if (reconnectTimer !== null) return;
+    if (!reconnectDeadline) reconnectDeadline = Date.now() + RECONNECT_BUDGET_MS;
+    if (Date.now() >= reconnectDeadline) {
+      setTransportState('lost');
+      report('Video channel did not come back; your screen is still shared');
+      return;
+    }
+    const delay = RECONNECT_DELAYS_MS[
+      Math.min(reconnectAttempt, RECONNECT_DELAYS_MS.length - 1)
+    ];
+    reconnectAttempt += 1;
+    setTransportState('reconnecting');
+    const generation = lifecycleGeneration;
+    reconnectTimer = window.setTimeout(() => {
+      reconnectTimer = null;
+      void retryTransport(kind, generation);
+    }, delay);
+  }
+
+  async function retryTransport(kind, generation) {
+    if (generation !== lifecycleGeneration || sessionState !== 'active') return;
+    if (!stream || !track || track.readyState === 'ended') {
+      // Capture genuinely ended; there is nothing left to reconnect for.
+      return;
+    }
+    detachTransport();
+    try {
+      await connectTransport(kind, generation);
+      report('Video channel reconnected');
+    } catch (error) {
+      if (error instanceof VideoSetupCancelledError) return;
+      scheduleReconnect(kind);
+    }
+  }
+
   async function enable(kind) {
     const generation = lifecycleGeneration;
     const acquired = preacquired && preacquired.kind === kind
       ? preacquired.stream
       : await acquireStream(kind);
     preacquired = null;
+    // The stream exists from here on. A failure below is a transport failure
+    // and must not take the user's screen share down with it.
     try {
       requireActiveLifecycle(generation);
-      const done = await requestMode(true, kind, generation);
-      requireActiveLifecycle(generation);
-      const config = done.screen;
-      if (!config) throw new Error('Runtime did not offer a screen channel');
       await attachStream(acquired);
       requireActiveLifecycle(generation);
-      await openScreenSocket(
-        { ...config, session_id: done.session_id || sessionId() },
-        generation
-      );
-      requireActiveLifecycle(generation);
-      activeSource = kind;
-      framesSent = 0;
-      showPreview(true);
-      await sendInitialFrame(generation);
-      requireActiveLifecycle(generation);
-      startPacer();
-      setState(describe());
-      updateNote();
+      setTransportState('connecting');
+      const done = await connectTransport(kind, generation);
       for (const warning of done.warnings || []) report(`Video caveat: ${warning}`);
       report(`Video enabled: ${kind} at ${frameRate()} Hz, ${done.estimated_tokens_per_unit} tokens/unit`);
     } catch (error) {
-      for (const item of acquired.getTracks()) {
-        try { item.stop(); } catch (_) {}
+      if (error instanceof VideoSetupCancelledError) {
+        // The session went away underneath us; release what we acquired.
+        await stopCapture({ notifyServer: false });
+        throw error;
       }
-      throw error;
+      activeSource = kind;
+      showPreview(true);
+      report(`Video setup failed, keeping the share: ${error.message || error}`);
+      scheduleReconnect(kind);
     }
   }
 
-  async function disable({ notifyServer = true } = {}) {
+  // The only path that ends the operating system's capture. Reached from an
+  // explicit Stop, the browser's own stop-sharing control, page unload, or a
+  // failure to acquire the stream in the first place.
+  async function stopCapture({ notifyServer = true } = {}) {
+    cancelReconnect();
     activeSource = null;
-    stopPacer();
-    closeScreenSocket();
+    detachTransport();
     releaseStream();
     showPreview(false);
+    setTransportState('idle');
     setState('Off');
     updateNote();
     if (runtimeVideoEnabled && notifyServer) {
@@ -497,10 +588,12 @@
   }
 
   function onTrackEnded() {
-    // Observe the browser's native stop-sharing action.
+    // The browser's native stop-sharing control, or a revoked permission.
+    // This is the one genuine "capture ended" signal, and the only automatic
+    // path that clears the user's selection.
     report('Video source ended');
     revertSelect();
-    void disable();
+    void stopCapture();
   }
 
   async function applySelection() {
@@ -510,13 +603,13 @@
     if (sessionState !== 'active') return;
     select.disabled = true;
     try {
-      if (activeSource) await disable();
+      if (activeSource) await stopCapture();
       if (kind) await enable(kind);
     } catch (error) {
       if (error instanceof VideoSetupCancelledError || sessionState !== 'active') return;
       report(`Video unavailable: ${error.message || error}`);
       revertSelect();
-      await disable();
+      await stopCapture();
     } finally {
       select.disabled = !['idle', 'active'].includes(sessionState);
     }
@@ -526,6 +619,12 @@
 
   const stored = window.localStorage.getItem(STORAGE_KEY);
   if (stored) select.value = stored;
+
+  // Leaving the page is a real capture end.
+  window.addEventListener('pagehide', () => {
+    cancelReconnect();
+    releaseStream();
+  });
 
   window.GanderVideo = {
     // Health capabilities allow screen permission within the Start gesture.
@@ -618,7 +717,24 @@
     setSessionState(state) {
       sessionState = state;
       select.disabled = !['idle', 'active'].includes(state);
-      if (state === 'idle' && activeSource) void disable({ notifyServer: false });
+      if (state === 'idle' && activeSource) {
+        // The duplex session went away. Stop sending, but leave the share
+        // standing: only stop() ends capture, so a duplex that comes back
+        // can pick up the same stream without a second permission prompt.
+        cancelReconnect();
+        detachTransport();
+        runtimeVideoEnabled = false;
+        setTransportState('lost');
+      }
+    },
+
+    // Called once the duplex socket is back. The share never went away, so
+    // only the screen channel has to be rebuilt.
+    async resumeTransport() {
+      if (!activeSource) return;
+      if (!stream || !track || track.readyState === 'ended') return;
+      cancelReconnect();
+      await retryTransport(activeSource, lifecycleGeneration);
     },
 
     // Request screen permission before the Start gesture expires.
@@ -642,16 +758,29 @@
       }
     },
 
-    async stop() {
-      lifecycleGeneration += 1;
+    async stop({ keepCapture = false } = {}) {
       cancelPendingMode(new VideoSetupCancelledError());
+      cancelReconnect();
       if (preacquired) {
         for (const item of preacquired.stream.getTracks()) {
           try { item.stop(); } catch (_) {}
         }
         preacquired = null;
       }
-      await disable({ notifyServer: false });
+      if (keepCapture && activeSource) {
+        // A duplex drop we expect to recover from: hold the share.
+        detachTransport();
+        runtimeVideoEnabled = false;
+        setTransportState('lost');
+        return;
+      }
+      lifecycleGeneration += 1;
+      await stopCapture({ notifyServer: false });
+    },
+
+    // True while the user is still sharing, whatever the transport is doing.
+    isCapturing() {
+      return Boolean(activeSource && track && track.readyState !== 'ended');
     }
   };
 })();

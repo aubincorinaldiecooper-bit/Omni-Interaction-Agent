@@ -1091,7 +1091,21 @@ function handleServerEvent(message) {
   if (['memory.episode.done', 'break.done', 'clear_break.done', 'pong'].includes(message.type)) {
     return;
   }
-  if (message.type === 'error') throw new Error(message.message || 'Server error');
+  if (message.type === 'error') {
+    // Only an error the runtime calls fatal leaves the Thinker unusable.
+    // Everything else - a control event it did not understand, a rejected
+    // frame, a validation failure - is one line in the event log and the
+    // session carries on.
+    if (message.fatal) throw new Error(message.message || 'Server error');
+    addEvent(`Runtime: ${message.message || 'error'}`);
+    return;
+  }
+  if (message.type === 'brain.status') {
+    if (message.status === 'warming') addEvent('Brain: warming');
+    else if (message.status === 'ready') addEvent('Brain: ready');
+    else addEvent(`Brain: unavailable (${message.message || 'unknown'})`);
+    return;
+  }
 }
 
 async function requestJson(path, options = {}) {
@@ -1663,7 +1677,9 @@ async function cleanupAfterClose(forceClose, expectedWs = null, finalStatus = 'I
       }
     }
     await stopMic();
-    await window.GanderVideo?.stop();
+    // A close the user did not ask for keeps the capture: the screen share
+    // survives a dropped socket, and only Stop ends it.
+    await window.GanderVideo?.stop({ keepCapture: !forceClose });
     if (oldWs) await waitForRuntimeRelease();
 
     archiveCurrentConversation();
