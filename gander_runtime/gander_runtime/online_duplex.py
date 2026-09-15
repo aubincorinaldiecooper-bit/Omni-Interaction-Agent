@@ -49,6 +49,17 @@ SPEECH_PUMP_DRAIN_TIMEOUT_SEC = 5.0
 # the model slot, waiting for the same client to come back. The screen
 # channel stays open for this long too, so the share is not interrupted.
 RECONNECT_GRACE_SEC = 15.0
+# A client is not supposed to send anything before `ready`. What it does send
+# while the model opens is buffered, so the buffer is bounded: an unauthenticated
+# connection already holds the single model slot, and must not also be able to
+# grow the server's memory without limit.
+STARTUP_BUFFER_MAX_MESSAGES = 32
+STARTUP_BUFFER_MAX_BYTES = 4 * 1024 * 1024
+
+
+class _StartupFlood(Exception):
+    """A client sent more before `ready` than the startup buffer will hold."""
+
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 
@@ -1090,10 +1101,12 @@ def create_online_duplex_app(
         session: GanderDuplexSession | None = None
         coordinator: Any | None = None
         active: _ActiveSession | None = None
+        open_task: asyncio.Task[GanderDuplexSession] | None = None
         outbound_task: asyncio.Task[None] | None = None
         warmup_task: asyncio.Task[None] | None = None
         receive_watcher: asyncio.Task[dict[str, Any]] | None = None
         pending_messages: deque[dict[str, Any]] = deque()
+        pending_bytes = 0
         speech_output_task: asyncio.Task[None] | None = None
         speech_output_stop: asyncio.Event | None = None
         pending_audio_header: AudioFrameHeader | None = None
@@ -1239,6 +1252,57 @@ def create_online_duplex_app(
             # seeing and hearing must not wait on it.
             return task_coordinator
 
+        def release_model_slot() -> None:
+            """Free the single Thinker slot, exactly once.
+
+            The guard lives on the session when there is one, so the handler,
+            the grace timer and the abandoned-open cleanup cannot each release
+            it separately.
+            """
+
+            if active is not None:
+                if active.slot_released:
+                    return
+                active.slot_released = True
+            else:
+                if slot_state["released"]:
+                    return
+                slot_state["released"] = True
+            runtime.model_lock.release()
+            LOGGER.info("released model slot for %s", session_id)
+
+        async def close_abandoned_open(task: "asyncio.Task[Any]") -> None:
+            """Close a model session whose client left while it was opening.
+
+            The open runs on a worker thread that cancellation cannot reach, so
+            the session is still being built after the handler has gone. The
+            slot stays held until it exists and has been closed: releasing
+            early would let a second session build against the same model and
+            leave this one open forever.
+            """
+
+            try:
+                orphan = await task
+            except asyncio.CancelledError:
+                orphan = None
+            except Exception:
+                orphan = None
+                LOGGER.warning(
+                    "abandoned model open failed for %s", session_id, exc_info=True
+                )
+            try:
+                if orphan is not None and not orphan.closed:
+                    await asyncio.to_thread(orphan.close)
+                    LOGGER.info("closed abandoned model open for %s", session_id)
+            except Exception:
+                LOGGER.warning(
+                    "closing the abandoned model open for %s failed",
+                    session_id,
+                    exc_info=True,
+                )
+            finally:
+                release_model_slot()
+
         async def expire_reconnect_grace(
             held: _ActiveSession,
             detach: Callable[[], Awaitable[None]],
@@ -1301,7 +1365,7 @@ def create_online_duplex_app(
             async def run_startup() -> None:
                 """Open the Thinker and announce readiness."""
 
-                nonlocal session, active, coordinator
+                nonlocal session, active, coordinator, open_task
                 nonlocal outbound_task, warmup_task
                 nonlocal speech_output_stop, speech_output_task
 
@@ -1320,7 +1384,11 @@ def create_online_duplex_app(
                         )
                     LOGGER.info("duplex session resumed: %s", session_id)
                 else:
-                    session = await _open_session(runtime)
+                    open_task = asyncio.create_task(
+                        _open_session(runtime),
+                        name=f"gander-model-open-{session_id}",
+                    )
+                    session = await asyncio.shield(open_task)
                     if runtime.detached_talker is not None:
                         speech_output_stop, speech_output_task = (
                             start_speech_output_pump(session)
@@ -1520,7 +1588,16 @@ def create_online_duplex_app(
                     if early.get("type") == "websocket.disconnect":
                         raise WebSocketDisconnect(code=1006)
                     # Anything the client sent while we were starting is
-                    # kept in order for the main loop below.
+                    # kept in order for the main loop below, up to a bound.
+                    payload = early.get("text") or early.get("bytes") or b""
+                    pending_bytes += len(payload)
+                    if (
+                        len(pending_messages) >= STARTUP_BUFFER_MAX_MESSAGES
+                        or pending_bytes > STARTUP_BUFFER_MAX_BYTES
+                    ):
+                        raise _StartupFlood(
+                            "too much data sent before the session was ready"
+                        )
                     pending_messages.append(early)
                     receive_watcher = asyncio.create_task(
                         websocket.receive(),
@@ -1818,6 +1895,17 @@ def create_online_duplex_app(
             LOGGER.info("duplex websocket disconnected: %s", session_id)
             # A socket that dropped without a Stop is a candidate for resume.
             park_for_resume = True
+        except _StartupFlood as exc:
+            # The client's doing, not a fault here: no traceback, and the
+            # session ends rather than being held for a resume.
+            LOGGER.warning("duplex startup flood from %s: %s", session_id, exc)
+            try:
+                await send_text(
+                    {"type": "error", "message": str(exc), "fatal": True}
+                )
+                await websocket_outbox.join()
+            except (RuntimeError, WebSocketDisconnect):
+                pass
         except Exception as exc:
             LOGGER.exception("duplex websocket failed: %s", session_id)
             try:
@@ -1828,24 +1916,6 @@ def create_online_duplex_app(
             except (RuntimeError, WebSocketDisconnect):
                 pass
         finally:
-            def release_model_slot() -> None:
-                """Free the single Thinker slot, exactly once.
-
-                The guard lives on the session when there is one, so the
-                handler and the grace timer cannot both release it.
-                """
-
-                if active is not None:
-                    if active.slot_released:
-                        return
-                    active.slot_released = True
-                else:
-                    if slot_state["released"]:
-                        return
-                    slot_state["released"] = True
-                runtime.model_lock.release()
-                LOGGER.info("released model slot for %s", session_id)
-
             async def detach_connection() -> None:
                 """Stop everything tied to this socket, keeping the session."""
 
@@ -1895,6 +1965,34 @@ def create_online_duplex_app(
                     session_id,
                     runtime.settings.reconnect_grace_sec,
                 )
+                return
+
+            if session is None and open_task is not None and not open_task.cancelled():
+                # The client left while the model was still being built on a
+                # worker thread. Cancelling the await did not stop that thread,
+                # so the slot is handed to a task that waits for the session to
+                # exist and closes it. Releasing here would let a second
+                # session build against the same model while this one is
+                # finished and never closed.
+                abandoned = asyncio.create_task(
+                    close_abandoned_open(open_task),
+                    name=f"gander-abandoned-open-{session_id}",
+                )
+                runtime.grace_tasks.add(abandoned)
+                abandoned.add_done_callback(runtime.grace_tasks.discard)
+                LOGGER.info(
+                    "holding the model slot for %s until its abandoned open "
+                    "finishes",
+                    session_id,
+                )
+                try:
+                    await detach_connection()
+                except Exception:
+                    LOGGER.warning(
+                        "detaching the abandoned startup for %s failed",
+                        session_id,
+                        exc_info=True,
+                    )
                 return
 
             try:

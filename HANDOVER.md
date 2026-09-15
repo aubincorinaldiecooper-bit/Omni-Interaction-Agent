@@ -85,6 +85,10 @@ assertions).
   the server finishes parking the session, it gets the busy reply instead of
   resuming. The client retries on busy so it recovers, but the first attempt
   is wasted. The tests wait for `resumable_sessions` in `/health` to avoid it.
+- **A Start straight after a disconnect during the model open can be told
+  "busy".** The slot is held until the abandoned open finishes and its session
+  is closed, which is correct — releasing earlier would let a second session
+  build against the same model. The client retries, so it recovers.
 
 ## Things found while implementing, beyond the audit
 

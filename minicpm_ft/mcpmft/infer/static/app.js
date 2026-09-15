@@ -1791,9 +1791,11 @@ async function cleanupAfterClose(forceClose, expectedWs = null, finalStatus = 'I
       }
     }
     await stopMic();
-    // A close the user did not ask for keeps the capture: the screen share
-    // survives a dropped socket, and only Stop ends it.
-    await window.GanderVideo?.stop({ keepCapture: !forceClose });
+    // Every path here is the end of the session - the reconnect loop only
+    // calls it once it has given up - so the share ends with it. The capture
+    // is held across a drop by the reconnect loop itself, which does not run
+    // this until it is finished.
+    await window.GanderVideo?.stop();
     if (oldWs) await waitForRuntimeRelease();
 
     archiveCurrentConversation();

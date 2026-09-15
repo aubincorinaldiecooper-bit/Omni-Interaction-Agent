@@ -37,6 +37,15 @@ def connect(client, url: str):
             pass
 
 
+def _wait_until(predicate, timeout: float = 5.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.02)
+    return False
+
+
 def _drain_until(ws, wanted: str, limit: int = 20) -> dict:
     """Read frames until one of type ``wanted`` arrives."""
 
@@ -425,7 +434,13 @@ def test_undecodable_image_is_dropped_not_fatal(harness):
 
 
 def test_disconnect_during_startup_frees_the_slot(harness, caplog):
-    """A client that gives up while the model opens frees it (audit 15)."""
+    """A client that gives up while the model opens frees it (audit 15).
+
+    The slot comes back as soon as the abandoned open has finished and been
+    closed, rather than only when the whole startup sequence would have run.
+    A client reconnecting in that gap is told the model is busy and retries,
+    which is why this waits for `busy` to clear first.
+    """
 
     caplog.set_level("INFO")
     gate = threading.Event()
@@ -435,7 +450,60 @@ def test_disconnect_during_startup_frees_the_slot(harness, caplog):
             # Leave immediately, while _open_session is still blocked.
             pass
         gate.set()
-        # The slot must come back without a second session having to wait
-        # for the abandoned startup to finish on its own.
+        assert _wait_until(lambda: not client.get("/health").json()["busy"])
         with connect(client, "/ws/duplex?session_id=s2") as ws:
             assert _settle(ws)["session_id"] == "s2"
+            _stop(ws)
+
+
+def test_an_abandoned_model_open_is_closed_before_the_slot_is_freed(harness):
+    """A client that leaves mid-open must not strand a half-built session.
+
+    The open runs on a worker thread that cancellation cannot reach, so the
+    slot has to stay held until that thread produces a session and it is
+    closed. Freeing it earlier would let a second session build against the
+    same model while the first is finished and never closed.
+    """
+
+    gate = threading.Event()
+    h = harness(open_gate=gate)
+    with TestClient(h.app) as client:
+        with connect(client, "/ws/duplex?session_id=s1"):
+            # Leave while _build_session is still blocked on the gate.
+            pass
+        # The slot is not free yet: the model is still being built.
+        assert client.get("/health").json()["busy"] is True
+        assert h.thinkers == []
+
+        gate.set()
+        assert _wait_until(lambda: not client.get("/health").json()["busy"]), (
+            "the slot is freed once the abandoned open finishes"
+        )
+        assert len(h.thinkers) == 1
+        assert h.thinkers[0].close_count == 1, "the abandoned session is closed"
+
+        # And the slot really is usable again.
+        with connect(client, "/ws/duplex?session_id=s2") as ws:
+            assert _settle(ws)["session_id"] == "s2"
+            _stop(ws)
+
+
+def test_flooding_before_ready_is_refused(harness):
+    """Buffering what a client sends during startup is bounded."""
+
+    from gander_runtime.online_duplex import STARTUP_BUFFER_MAX_MESSAGES
+
+    gate = threading.Event()
+    h = harness(open_gate=gate)
+    try:
+        with TestClient(h.app) as client:
+            with connect(client, "/ws/duplex?session_id=s1") as ws:
+                # Nothing should be sent before `ready`; this is a client
+                # holding the model slot and growing the server's memory.
+                for index in range(STARTUP_BUFFER_MAX_MESSAGES + 4):
+                    ws.send_text(json.dumps({"type": "ping", "id": index}))
+                refused = _drain_until(ws, "error", limit=40)
+                assert refused["fatal"] is True
+                assert "before the session was ready" in refused["message"]
+    finally:
+        gate.set()
