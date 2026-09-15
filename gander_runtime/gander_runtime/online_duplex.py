@@ -8,6 +8,7 @@ import re
 import secrets
 import time
 import urllib.parse
+from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -41,6 +42,24 @@ from .task_tools_online import TaskToolsRealtimeCoordinator
 LOGGER = logging.getLogger(__name__)
 _SESSION_ID = re.compile(r"^(?!\.{1,2}$)[A-Za-z0-9_.-]{1,128}$")
 ONLINE_TASK_PROTOCOL = "task_tools_v1"
+# Longest we wait for the talker to finish draining before cancelling it.
+# Teardown holds the single model slot, so it must be bounded.
+SPEECH_PUMP_DRAIN_TIMEOUT_SEC = 5.0
+# How long a dropped duplex socket keeps its Thinker, its coordinator and
+# the model slot, waiting for the same client to come back. The screen
+# channel stays open for this long too, so the share is not interrupted.
+RECONNECT_GRACE_SEC = 15.0
+# A client is not supposed to send anything before `ready`. What it does send
+# while the model opens is buffered, so the buffer is bounded: an unauthenticated
+# connection already holds the single model slot, and must not also be able to
+# grow the server's memory without limit.
+STARTUP_BUFFER_MAX_MESSAGES = 32
+STARTUP_BUFFER_MAX_BYTES = 4 * 1024 * 1024
+
+
+class _StartupFlood(Exception):
+    """A client sent more before `ready` than the startup buffer will hold."""
+
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 
@@ -57,6 +76,9 @@ class OnlineDuplexSettings:
     asr_base_url: str | None = None
     asr_timeout_sec: float = 120.0
     turn_bind_grace_sec: float = 5.0
+    # How long a dropped duplex socket keeps its Thinker, its coordinator and
+    # the model slot, waiting for the same client to come back.
+    reconnect_grace_sec: float = RECONNECT_GRACE_SEC
     # Initial media mode for each session.
     media_mode: Literal["voice", "omni", "auto"] = "voice"
     # Allow clients to switch vision through `media.mode`.
@@ -84,6 +106,14 @@ class _ActiveSession:
     video_source: str | None = None
     coordinator: Any | None = None
     ended: asyncio.Event = field(default_factory=asyncio.Event)
+    # Reconnect grace. `attached` is False while the session is parked with no
+    # socket; `resumed` fires when a client re-binds; `slot_released` makes the
+    # model slot's release idempotent across the handler and the grace timer.
+    resume_token: str = ""
+    attached: bool = True
+    stopped: bool = False
+    slot_released: bool = False
+    resumed: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 @dataclass
@@ -101,6 +131,9 @@ class _Runtime:
     first_unit_warmup_seconds: float | None = None
     model_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     sessions: dict[str, _ActiveSession] = field(default_factory=dict)
+    # Strong references to in-flight grace timers: a task nobody holds can be
+    # garbage-collected while pending, skipping its teardown entirely.
+    grace_tasks: set[asyncio.Task[None]] = field(default_factory=set)
 
 
 def _json(payload: dict[str, Any]) -> str:
@@ -735,6 +768,13 @@ def create_online_duplex_app(
             "status": "ok",
             "busy": runtime.model_lock.locked(),
             "active_sessions": list(runtime.sessions),
+            # Sessions whose socket dropped and that are inside their
+            # reconnect window: the same client can still re-bind to them.
+            "resumable_sessions": [
+                name
+                for name, active in runtime.sessions.items()
+                if not active.attached and not active.stopped
+            ],
             "session_media_modes": {
                 name: active.media_mode
                 for name, active in runtime.sessions.items()
@@ -907,78 +947,98 @@ def create_online_duplex_app(
                     return
                 if metadata_message.get("type") == "websocket.disconnect":
                     return
-                raw_metadata = metadata_message.get("text")
-                if raw_metadata is None:
-                    raise ValueError("screen frame metadata must be JSON text")
-                payload = json.loads(raw_metadata)
-                if not isinstance(payload, dict):
-                    raise ValueError("screen frame metadata must be an object")
-                header = ScreenFrameHeader.from_payload(payload)
+                frame_id: Any = None
+                try:
+                    raw_metadata = metadata_message.get("text")
+                    if raw_metadata is None:
+                        raise ValueError("screen frame metadata must be JSON text")
+                    payload = json.loads(raw_metadata)
+                    if not isinstance(payload, dict):
+                        raise ValueError("screen frame metadata must be an object")
+                    header = ScreenFrameHeader.from_payload(payload)
+                    frame_id = header.frame_id
 
-                image_message = await receive_while_session_active()
-                if image_message is None:
-                    return
-                if image_message.get("type") == "websocket.disconnect":
-                    return
-                image_payload = image_message.get("bytes")
-                if image_payload is None:
-                    raise ValueError("screen frame image must be binary")
-                decoded = await asyncio.to_thread(
-                    decode_screen_frame,
-                    header,
-                    image_payload,
-                    max_bytes=runtime.settings.max_screen_frame_bytes,
-                    max_pixels=runtime.settings.max_screen_pixels,
-                )
-                if runtime.sessions.get(session_id) is not active:
-                    return
-                if active.media_mode == "voice":
-                    # Ignore a frame completed after the session returned to audio mode.
+                    image_message = await receive_while_session_active()
+                    if image_message is None:
+                        return
+                    if image_message.get("type") == "websocket.disconnect":
+                        return
+                    image_payload = image_message.get("bytes")
+                    if image_payload is None:
+                        raise ValueError("screen frame image must be binary")
+                    decoded = await asyncio.to_thread(
+                        decode_screen_frame,
+                        header,
+                        image_payload,
+                        max_bytes=runtime.settings.max_screen_frame_bytes,
+                        max_pixels=runtime.settings.max_screen_pixels,
+                    )
+                    if runtime.sessions.get(session_id) is not active:
+                        return
+                    if active.media_mode == "voice":
+                        # Ignore a frame completed after the session returned to audio mode.
+                        await websocket.send_text(
+                            _json(
+                                {
+                                    "type": "screen.frame.dropped",
+                                    "frame_id": header.frame_id,
+                                    "reason": "media_mode is voice",
+                                }
+                            )
+                        )
+                        continue
+
+                    context_sampled = active.codex_frame_gate.accept(
+                        header.captured_at_ms
+                    )
+                    # Publish to the front brain before ACK; persist off the event loop.
+                    active.duplex.enqueue_screen_frame(decoded.frame)
+                    await websocket.send_text(
+                        _json(
+                            {
+                                "type": "screen.frame.accepted",
+                                "frame_id": header.frame_id,
+                                "captured_at_ms": header.captured_at_ms,
+                                "width": decoded.width,
+                                "height": decoded.height,
+                                "asset_id": decoded.asset_id,
+                                "context_sampled": context_sampled,
+                            }
+                        )
+                    )
+                    if context_sampled:
+                        # Tag webcam and screen frames separately for back-brain context.
+                        source = header.video_source or active.video_source
+                        media = await _screen_media_ref(
+                            runtime,
+                            session_id,
+                            header,
+                            image_payload,
+                            decoded,
+                            kind="frame" if source == "camera" else "screen",
+                        )
+                        if runtime.sessions.get(session_id) is not active:
+                            return
+                        coordinator = active.coordinator
+                        if coordinator is not None:
+                            coordinator.remember_media(media)
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    # One malformed or undecodable frame is not a reason to end
+                    # the screen channel. The capture is still good and the next
+                    # frame usually is too, so report the drop and keep going.
+                    LOGGER.warning(
+                        "dropping screen frame for %s: %s", session_id, exc
+                    )
                     await websocket.send_text(
                         _json(
                             {
                                 "type": "screen.frame.dropped",
-                                "frame_id": header.frame_id,
-                                "reason": "media_mode is voice",
+                                "frame_id": frame_id,
+                                "reason": str(exc),
                             }
                         )
                     )
                     continue
-
-                context_sampled = active.codex_frame_gate.accept(
-                    header.captured_at_ms
-                )
-                # Publish to the front brain before ACK; persist off the event loop.
-                active.duplex.enqueue_screen_frame(decoded.frame)
-                await websocket.send_text(
-                    _json(
-                        {
-                            "type": "screen.frame.accepted",
-                            "frame_id": header.frame_id,
-                            "captured_at_ms": header.captured_at_ms,
-                            "width": decoded.width,
-                            "height": decoded.height,
-                            "asset_id": decoded.asset_id,
-                            "context_sampled": context_sampled,
-                        }
-                    )
-                )
-                if context_sampled:
-                    # Tag webcam and screen frames separately for back-brain context.
-                    source = header.video_source or active.video_source
-                    media = await _screen_media_ref(
-                        runtime,
-                        session_id,
-                        header,
-                        image_payload,
-                        decoded,
-                        kind="frame" if source == "camera" else "screen",
-                    )
-                    if runtime.sessions.get(session_id) is not active:
-                        return
-                    coordinator = active.coordinator
-                    if coordinator is not None:
-                        coordinator.remember_media(media)
         except WebSocketDisconnect:
             return
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -996,21 +1056,57 @@ def create_online_duplex_app(
         requested_id = websocket.query_params.get("session_id")
         session_id = requested_id or f"duplex_{secrets.token_hex(8)}"
         if not _SESSION_ID.fullmatch(session_id):
-            await websocket.send_text(_json({"type": "error", "message": "invalid session_id"}))
+            await websocket.send_text(
+                _json(
+                    {
+                        "type": "error",
+                        "message": "invalid session_id",
+                        "fatal": True,
+                    }
+                )
+            )
             await websocket.close(code=1008)
             return
-        if runtime.model_lock.locked():
-            await websocket.send_text(
-                _json({"type": "error", "message": "model is busy with another session"})
-            )
-            await websocket.close(code=1013)
-            return
+        # A session whose socket dropped is held briefly. The same client,
+        # with the token it was given, re-binds to its own Thinker instead of
+        # queuing behind it for the model slot it is already holding.
+        resume_token = websocket.query_params.get("resume_token") or ""
+        parked = runtime.sessions.get(session_id)
+        resuming = bool(
+            parked is not None
+            and not parked.attached
+            and not parked.stopped
+            and resume_token
+            and parked.resume_token
+            and secrets.compare_digest(resume_token, parked.resume_token)
+        )
+        if not resuming:
+            if runtime.model_lock.locked():
+                await websocket.send_text(
+                    _json(
+                        {
+                            "type": "error",
+                            "message": "model is busy with another session",
+                            "fatal": False,
+                            "retry": True,
+                        }
+                    )
+                )
+                await websocket.close(code=1013)
+                return
+            await runtime.model_lock.acquire()
 
-        await runtime.model_lock.acquire()
+        park_for_resume = False
+        slot_state = {"released": False}
         session: GanderDuplexSession | None = None
         coordinator: Any | None = None
         active: _ActiveSession | None = None
+        open_task: asyncio.Task[GanderDuplexSession] | None = None
         outbound_task: asyncio.Task[None] | None = None
+        warmup_task: asyncio.Task[None] | None = None
+        receive_watcher: asyncio.Task[dict[str, Any]] | None = None
+        pending_messages: deque[dict[str, Any]] = deque()
+        pending_bytes = 0
         speech_output_task: asyncio.Task[None] | None = None
         speech_output_stop: asyncio.Event | None = None
         pending_audio_header: AudioFrameHeader | None = None
@@ -1022,11 +1118,28 @@ def create_online_duplex_app(
             websocket, runtime.settings.output_sample_rate
         )
 
+        async def receive_message() -> dict[str, Any]:
+            """Next client message, oldest first.
+
+            Anything the client sent while the session was still starting was
+            buffered by the startup watcher, and is delivered before the
+            socket is read again.
+            """
+
+            if pending_messages:
+                return pending_messages.popleft()
+            return await websocket.receive()
+
         async def send_text(
             payload: dict[str, Any],
             *,
             wait_sent: bool = False,
         ) -> None:
+            if payload.get("type") == "error" and "fatal" not in payload:
+                # Control-parsing and validation errors leave the Thinker
+                # usable, so they must not end the client's session. Only a
+                # caller that knows otherwise sets fatal=True.
+                payload = {**payload, "fatal": False}
             await websocket_outbox.send_text(payload, wait_sent=wait_sent)
 
         async def send_model_event(
@@ -1050,7 +1163,11 @@ def create_online_duplex_app(
                             audio=type(event).__name__
                             in {"SpeechSynthesisChunk", "SpeechSynthesisDone"},
                         )
-                        continue
+                        if not stop.is_set():
+                            continue
+                        # Stop arrived mid-stream. Fall through to drain what
+                        # is already buffered rather than following the model
+                        # for as long as it keeps producing.
                     if stop.is_set():
                         for remaining in target.drain_outputs():
                             await websocket_outbox.send_event(
@@ -1073,11 +1190,30 @@ def create_online_duplex_app(
             nonlocal speech_output_task, speech_output_stop
             if speech_output_stop is not None:
                 speech_output_stop.set()
-            if speech_output_task is not None:
+            task = speech_output_task
+            if task is not None:
                 try:
-                    await speech_output_task
-                except (WebSocketDisconnect, RuntimeError):
-                    pass
+                    await asyncio.wait_for(
+                        asyncio.shield(task), SPEECH_PUMP_DRAIN_TIMEOUT_SEC
+                    )
+                except asyncio.TimeoutError:
+                    LOGGER.warning(
+                        "speech output pump for %s did not drain in %.1fs; "
+                        "cancelling",
+                        session_id,
+                        SPEECH_PUMP_DRAIN_TIMEOUT_SEC,
+                    )
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+                except Exception:
+                    # The pump re-raises whatever the websocket writer stored,
+                    # which is any exception type at all. Teardown must not
+                    # depend on which one it is.
+                    LOGGER.debug(
+                        "speech output pump for %s ended in error",
+                        session_id,
+                        exc_info=True,
+                    )
             speech_output_task = None
             speech_output_stop = None
 
@@ -1112,132 +1248,383 @@ def create_online_duplex_app(
                 close_ledger=True,
             )
             await task_coordinator.start()
-            await _warm_backbrain_providers(gateway)
+            # The Brain is warmed in the background once the client is ready;
+            # seeing and hearing must not wait on it.
             return task_coordinator
 
-        try:
-            session = await _open_session(runtime)
-            if runtime.detached_talker is not None:
-                speech_output_stop, speech_output_task = start_speech_output_pump(
-                    session
+        def release_model_slot() -> None:
+            """Free the single Thinker slot, exactly once.
+
+            The guard lives on the session when there is one, so the handler,
+            the grace timer and the abandoned-open cleanup cannot each release
+            it separately.
+            """
+
+            if active is not None:
+                if active.slot_released:
+                    return
+                active.slot_released = True
+            else:
+                if slot_state["released"]:
+                    return
+                slot_state["released"] = True
+            runtime.model_lock.release()
+            LOGGER.info("released model slot for %s", session_id)
+
+        async def close_abandoned_open(task: "asyncio.Task[Any]") -> None:
+            """Close a model session whose client left while it was opening.
+
+            The open runs on a worker thread that cancellation cannot reach, so
+            the session is still being built after the handler has gone. The
+            slot stays held until it exists and has been closed: releasing
+            early would let a second session build against the same model and
+            leave this one open forever.
+            """
+
+            try:
+                orphan = await task
+            except asyncio.CancelledError:
+                orphan = None
+            except Exception:
+                orphan = None
+                LOGGER.warning(
+                    "abandoned model open failed for %s", session_id, exc_info=True
                 )
-            active = _ActiveSession(
-                duplex=session,
-                screen_token=secrets.token_urlsafe(32),
-                codex_frame_gate=ScreenFrameRateGate(
-                    _codex_frame_interval_ms(runtime)
-                ),
-                media_mode=runtime.settings.media_mode,
-            )
-            runtime.sessions[session_id] = active
-            coordinator = await build_coordinator(session)
-            active.coordinator = coordinator
+            try:
+                if orphan is not None and not orphan.closed:
+                    await asyncio.to_thread(orphan.close)
+                    LOGGER.info("closed abandoned model open for %s", session_id)
+            except Exception:
+                LOGGER.warning(
+                    "closing the abandoned model open for %s failed",
+                    session_id,
+                    exc_info=True,
+                )
+            finally:
+                release_model_slot()
 
-            async def forward_tool_outputs() -> None:
-                assert coordinator is not None
-                while True:
-                    output = await coordinator.next_output()
-                    if output.kind == "control":
-                        await send_text(
-                            output.value,
-                            wait_sent=output.delivery_id is not None,
-                        )
-                    else:
-                        await send_model_event(
-                            output.value,
-                            wait_sent=output.delivery_id is not None,
-                        )
-                    if output.delivery_id is not None:
-                        coordinator.acknowledge_output(output)
+        async def expire_reconnect_grace(
+            held: _ActiveSession,
+            detach: Callable[[], Awaitable[None]],
+        ) -> None:
+            """Hold a parked session, then tear it down if nobody returns.
 
-            outbound_task = asyncio.create_task(
-                forward_tool_outputs(),
-                name=f"gander-native-tool-output-{session_id}",
-            )
-            outbound_task.add_done_callback(
-                lambda task: (
-                    None
-                    if task.cancelled()
-                    else LOGGER.error(
-                        "native tool output loop failed for %s: %s",
+            The detach runs here rather than in the handler: a handler that
+            was cancelled cannot await anything, and the session must still be
+            parked and cleaned up.
+            """
+
+            try:
+                await detach()
+            except Exception:
+                LOGGER.warning(
+                    "detaching %s for resume failed", session_id, exc_info=True
+                )
+            try:
+                await asyncio.wait_for(
+                    held.resumed.wait(), runtime.settings.reconnect_grace_sec
+                )
+                return
+            except asyncio.TimeoutError:
+                pass
+            if held.attached:
+                # A client re-bound between the timeout and this check.
+                return
+            LOGGER.info("reconnect grace expired for %s", session_id)
+            try:
+                if runtime.sessions.get(session_id) is held:
+                    runtime.sessions.pop(session_id, None)
+                # Only now does /ws/screen learn the session is over.
+                held.ended.set()
+                if held.coordinator is not None:
+                    await held.coordinator.stop_model_jobs()
+            except Exception:
+                LOGGER.warning(
+                    "grace teardown failed for %s", session_id, exc_info=True
+                )
+            finally:
+                try:
+                    if not held.duplex.closed:
+                        held.duplex.close()
+                finally:
+                    if not held.slot_released:
+                        held.slot_released = True
+                        runtime.model_lock.release()
+                        LOGGER.info("released model slot for %s", session_id)
+            if held.coordinator is not None:
+                try:
+                    await held.coordinator.close()
+                except Exception:
+                    LOGGER.warning(
+                        "worker gateway teardown failed for %s",
                         session_id,
-                        task.exception(),
+                        exc_info=True,
                     )
-                    if task.exception() is not None
-                    else None
+
+        try:
+            async def run_startup() -> None:
+                """Open the Thinker and announce readiness."""
+
+                nonlocal session, active, coordinator, open_task
+                nonlocal outbound_task, warmup_task
+                nonlocal speech_output_stop, speech_output_task
+
+                if resuming and parked is not None:
+                    # Same Thinker, same coordinator, same model slot. Only
+                    # the connection is new, so nothing is reloaded and the
+                    # conversation carries on where it left off.
+                    active = parked
+                    session = active.duplex
+                    coordinator = active.coordinator
+                    active.attached = True
+                    active.resumed.set()
+                    if runtime.detached_talker is not None:
+                        speech_output_stop, speech_output_task = (
+                            start_speech_output_pump(session)
+                        )
+                    LOGGER.info("duplex session resumed: %s", session_id)
+                else:
+                    open_task = asyncio.create_task(
+                        _open_session(runtime),
+                        name=f"gander-model-open-{session_id}",
+                    )
+                    session = await asyncio.shield(open_task)
+                    if runtime.detached_talker is not None:
+                        speech_output_stop, speech_output_task = (
+                            start_speech_output_pump(session)
+                        )
+                    active = _ActiveSession(
+                        duplex=session,
+                        screen_token=secrets.token_urlsafe(32),
+                        codex_frame_gate=ScreenFrameRateGate(
+                            _codex_frame_interval_ms(runtime)
+                        ),
+                        media_mode=runtime.settings.media_mode,
+                        resume_token=secrets.token_urlsafe(32),
+                    )
+                    runtime.sessions[session_id] = active
+                    coordinator = await build_coordinator(session)
+                    active.coordinator = coordinator
+
+                async def forward_tool_outputs() -> None:
+                    assert coordinator is not None
+                    while True:
+                        output = await coordinator.next_output()
+                        if output.kind == "control":
+                            await send_text(
+                                output.value,
+                                wait_sent=output.delivery_id is not None,
+                            )
+                        else:
+                            await send_model_event(
+                                output.value,
+                                wait_sent=output.delivery_id is not None,
+                            )
+                        if output.delivery_id is not None:
+                            coordinator.acknowledge_output(output)
+
+                outbound_task = asyncio.create_task(
+                    forward_tool_outputs(),
+                    name=f"gander-native-tool-output-{session_id}",
                 )
-            )
-            screen_enabled = (
-                active.media_mode != "voice" or _client_video_allowed(runtime)
-            )
-            await send_text(
-                {
-                    "type": "ready",
-                    "session_id": session_id,
-                    "input_sample_rate": runtime.settings.input_sample_rate,
-                    "output_sample_rate": runtime.settings.output_sample_rate,
-                    "chunk_ms": runtime.params.chunk_ms,
-                    "audio_input": {
-                        "protocol": AUDIO_INPUT_PROTOCOL,
-                        "encoding": "pcm_s16le",
-                        "clock": "unix_ms",
-                    },
-                    "generate_audio": bool(
-                        runtime.params.generate_audio
-                        or runtime.detached_talker is not None
-                    ),
-                    "detached_talker": runtime.detached_talker is not None,
-                    "generation_id": int(
-                        session.talker_state().get("generation_id", 0)
-                    ),
-                    "sliding_window_mode": runtime.params.sliding_window_mode,
-                    "context_max_units": runtime.params.context_max_units,
-                    "context_previous_max_tokens": (
-                        runtime.params.context_previous_max_tokens
-                    ),
-                    "transport": "ws",
-                    "decode_mode": runtime.settings.decode_mode,
-                    "media_mode": active.media_mode,
-                    "video_source": active.video_source,
-                    "tool_protocol": "native_complete_call_v1",
-                    "task_protocol": ONLINE_TASK_PROTOCOL,
-                    "turn_bind_grace_ms": round(
-                        runtime.settings.turn_bind_grace_sec * 1000
-                    ),
-                    "tools": _tool_names(runtime),
-                    "context_events": [
-                        "turn.final",
-                        *(
-                            ["memory.episode"]
-                            if runtime.params.sliding_window_mode == "context_memory"
-                            else []
+                outbound_task.add_done_callback(
+                    lambda task: (
+                        None
+                        if task.cancelled()
+                        else LOGGER.error(
+                            "native tool output loop failed for %s: %s",
+                            session_id,
+                            task.exception(),
+                        )
+                        if task.exception() is not None
+                        else None
+                    )
+                )
+                screen_enabled = (
+                    active.media_mode != "voice" or _client_video_allowed(runtime)
+                )
+                await send_text(
+                    {
+                        "type": "ready",
+                        "session_id": session_id,
+                        "resume_token": active.resume_token,
+                        "resumed": resuming,
+                        "reconnect_grace_ms": round(
+                            runtime.settings.reconnect_grace_sec * 1000
                         ),
-                        "task_status",
-                        "screen",
-                    ],
-                    "screen": {
-                        "enabled": screen_enabled,
-                        "path": "/ws/screen" if screen_enabled else None,
-                        "token": active.screen_token if screen_enabled else None,
-                        "protocol": "metadata-json+encoded-binary-v1",
-                        "encodings": ["jpeg", "webp", "png"],
-                        "max_frame_bytes": runtime.settings.max_screen_frame_bytes,
-                        "max_pixels": runtime.settings.max_screen_pixels,
-                        "vision_max_slice_nums": runtime.settings.vision_max_slice_nums,
-                        "vision_batch_feed": runtime.settings.vision_batch_feed,
-                        "recommended_frame_rate": _unit_frame_rate(runtime),
-                        "codex_frame_rate": _codex_frame_rate(runtime),
-                        "codex_screen_history_seconds": (
-                            runtime.settings.codex_screen_history_seconds
+                        "input_sample_rate": runtime.settings.input_sample_rate,
+                        "output_sample_rate": runtime.settings.output_sample_rate,
+                        "chunk_ms": runtime.params.chunk_ms,
+                        "audio_input": {
+                            "protocol": AUDIO_INPUT_PROTOCOL,
+                            "encoding": "pcm_s16le",
+                            "clock": "unix_ms",
+                        },
+                        "generate_audio": bool(
+                            runtime.params.generate_audio
+                            or runtime.detached_talker is not None
                         ),
-                        "client_video": _client_video_capabilities(runtime),
-                    },
-                }
+                        "detached_talker": runtime.detached_talker is not None,
+                        "generation_id": int(
+                            session.talker_state().get("generation_id", 0)
+                        ),
+                        "sliding_window_mode": runtime.params.sliding_window_mode,
+                        "context_max_units": runtime.params.context_max_units,
+                        "context_previous_max_tokens": (
+                            runtime.params.context_previous_max_tokens
+                        ),
+                        "transport": "ws",
+                        "decode_mode": runtime.settings.decode_mode,
+                        "media_mode": active.media_mode,
+                        "video_source": active.video_source,
+                        "tool_protocol": "native_complete_call_v1",
+                        "task_protocol": ONLINE_TASK_PROTOCOL,
+                        "turn_bind_grace_ms": round(
+                            runtime.settings.turn_bind_grace_sec * 1000
+                        ),
+                        "tools": _tool_names(runtime),
+                        "context_events": [
+                            "turn.final",
+                            *(
+                                ["memory.episode"]
+                                if runtime.params.sliding_window_mode == "context_memory"
+                                else []
+                            ),
+                            "task_status",
+                            "screen",
+                        ],
+                        "screen": {
+                            "enabled": screen_enabled,
+                            "path": "/ws/screen" if screen_enabled else None,
+                            "token": active.screen_token if screen_enabled else None,
+                            "protocol": "metadata-json+encoded-binary-v1",
+                            "encodings": ["jpeg", "webp", "png"],
+                            "max_frame_bytes": runtime.settings.max_screen_frame_bytes,
+                            "max_pixels": runtime.settings.max_screen_pixels,
+                            "vision_max_slice_nums": runtime.settings.vision_max_slice_nums,
+                            "vision_batch_feed": runtime.settings.vision_batch_feed,
+                            "recommended_frame_rate": _unit_frame_rate(runtime),
+                            "codex_frame_rate": _codex_frame_rate(runtime),
+                            "codex_screen_history_seconds": (
+                                runtime.settings.codex_screen_history_seconds
+                            ),
+                            "client_video": _client_video_capabilities(runtime),
+                        },
+                    }
+                )
+
+                async def warm_back_brain() -> None:
+                    """Warm the Brain behind the session that is already running.
+
+                    Gander is perceptually ready before this finishes. A delegated
+                    task that arrives first is not dropped: the provider's worker
+                    start is guarded by its own lock, so the task waits for the
+                    same warm-up rather than starting a second one.
+                    """
+
+                    try:
+                        await send_text({"type": "brain.status", "status": "warming"})
+                        await _warm_backbrain_providers(coordinator.gateway)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        # An unreachable or cold Brain costs delegated work, not
+                        # the session: Gander can still see, hear and answer.
+                        LOGGER.warning(
+                            "back brain warmup failed for %s: %s", session_id, exc
+                        )
+                        try:
+                            await send_text(
+                                {
+                                    "type": "brain.status",
+                                    "status": "error",
+                                    "message": str(exc),
+                                }
+                            )
+                        except Exception:
+                            LOGGER.debug(
+                                "could not report brain warmup failure for %s",
+                                session_id,
+                                exc_info=True,
+                            )
+                    else:
+                        try:
+                            await send_text(
+                                {"type": "brain.status", "status": "ready"}
+                            )
+                        except Exception:
+                            LOGGER.debug(
+                                "could not report brain readiness for %s",
+                                session_id,
+                                exc_info=True,
+                            )
+
+                if not resuming:
+                    # A resumed session already has a warm Brain.
+                    warmup_task = asyncio.create_task(
+                        warm_back_brain(),
+                        name=f"gander-brain-warmup-{session_id}",
+                    )
+
+            # Watch the socket while the session starts. A client that
+            # gives up during the model open must free the Thinker slot
+            # now, not whenever startup happens to finish.
+            receive_watcher = asyncio.create_task(
+                websocket.receive(),
+                name=f"gander-duplex-receive-{session_id}",
             )
+            startup = asyncio.create_task(
+                run_startup(), name=f"gander-duplex-startup-{session_id}"
+            )
+            try:
+                while not startup.done():
+                    await asyncio.wait(
+                        {startup, receive_watcher},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if not receive_watcher.done():
+                        continue
+                    early = receive_watcher.result()
+                    if early.get("type") == "websocket.disconnect":
+                        raise WebSocketDisconnect(code=1006)
+                    # Anything the client sent while we were starting is
+                    # kept in order for the main loop below, up to a bound.
+                    payload = early.get("text") or early.get("bytes") or b""
+                    pending_bytes += len(payload)
+                    if (
+                        len(pending_messages) >= STARTUP_BUFFER_MAX_MESSAGES
+                        or pending_bytes > STARTUP_BUFFER_MAX_BYTES
+                    ):
+                        raise _StartupFlood(
+                            "too much data sent before the session was ready"
+                        )
+                    pending_messages.append(early)
+                    receive_watcher = asyncio.create_task(
+                        websocket.receive(),
+                        name=f"gander-duplex-receive-{session_id}",
+                    )
+            finally:
+                if not startup.done():
+                    startup.cancel()
+                    await asyncio.gather(startup, return_exceptions=True)
+                if receive_watcher is not None:
+                    # Hand the socket back to the main loop. Cancelling a
+                    # receive that has not produced anything consumes nothing,
+                    # and a message that landed in the meantime is kept.
+                    receive_watcher.cancel()
+                    await asyncio.gather(receive_watcher, return_exceptions=True)
+                    if not receive_watcher.cancelled():
+                        if receive_watcher.exception() is None:
+                            pending_messages.append(receive_watcher.result())
+                    receive_watcher = None
+            # Surface anything startup itself raised.
+            await startup
+
 
             while True:
-                message = await websocket.receive()
+                message = await receive_message()
                 if message.get("type") == "websocket.disconnect":
+                    park_for_resume = True
                     return
                 if message.get("bytes") is not None:
                     audio = message["bytes"]
@@ -1311,6 +1698,9 @@ def create_online_duplex_app(
                 elif event_type == "ping":
                     await send_text({"type": "pong", "id": control.get("id")})
                 elif event_type == "stop":
+                    # An explicit Stop ends the session; it is never parked.
+                    if active is not None:
+                        active.stopped = True
                     await _drain(
                         session,
                         emit_model_event,
@@ -1503,37 +1893,145 @@ def create_online_duplex_app(
                     )
         except WebSocketDisconnect:
             LOGGER.info("duplex websocket disconnected: %s", session_id)
+            # A socket that dropped without a Stop is a candidate for resume.
+            park_for_resume = True
+        except _StartupFlood as exc:
+            # The client's doing, not a fault here: no traceback, and the
+            # session ends rather than being held for a resume.
+            LOGGER.warning("duplex startup flood from %s: %s", session_id, exc)
+            try:
+                await send_text(
+                    {"type": "error", "message": str(exc), "fatal": True}
+                )
+                await websocket_outbox.join()
+            except (RuntimeError, WebSocketDisconnect):
+                pass
         except Exception as exc:
             LOGGER.exception("duplex websocket failed: %s", session_id)
             try:
-                await send_text({"type": "error", "message": str(exc)})
+                await send_text(
+                    {"type": "error", "message": str(exc), "fatal": True}
+                )
                 await websocket_outbox.join()
             except (RuntimeError, WebSocketDisconnect):
                 pass
         finally:
+            async def detach_connection() -> None:
+                """Stop everything tied to this socket, keeping the session."""
+
+                if (
+                    runtime.detached_talker is not None
+                    and session is not None
+                    and not session.closed
+                ):
+                    try:
+                        await asyncio.to_thread(session.interrupt_output)
+                    except RuntimeError:
+                        pass
+                await stop_speech_output_pump()
+                if warmup_task is not None:
+                    warmup_task.cancel()
+                    await asyncio.gather(warmup_task, return_exceptions=True)
+                if outbound_task is not None:
+                    outbound_task.cancel()
+                    await asyncio.gather(outbound_task, return_exceptions=True)
+                await websocket_outbox.close()
+
             if (
-                runtime.detached_talker is not None
-                and session is not None
-                and not session.closed
+                park_for_resume
+                and active is not None
+                and not active.stopped
+                and runtime.sessions.get(session_id) is active
             ):
+                # The socket dropped and nobody asked to stop. Hold the
+                # Thinker, the coordinator and the slot for a short window so
+                # the same client can come back to the same conversation, and
+                # leave /ws/screen open meanwhile so the share is untouched.
+                #
+                # Nothing here awaits. If this handler was cancelled rather
+                # than disconnected, an await would re-raise immediately and
+                # the session would be dropped instead of held; the grace
+                # timer does the waiting, and this only records the decision.
+                active.attached = False
+                active.resumed = asyncio.Event()
+                grace_task = asyncio.create_task(
+                    expire_reconnect_grace(active, detach_connection),
+                    name=f"gander-duplex-grace-{session_id}",
+                )
+                runtime.grace_tasks.add(grace_task)
+                grace_task.add_done_callback(runtime.grace_tasks.discard)
+                LOGGER.info(
+                    "holding %s for %.1fs for a reconnect",
+                    session_id,
+                    runtime.settings.reconnect_grace_sec,
+                )
+                return
+
+            if session is None and open_task is not None and not open_task.cancelled():
+                # The client left while the model was still being built on a
+                # worker thread. Cancelling the await did not stop that thread,
+                # so the slot is handed to a task that waits for the session to
+                # exist and closes it. Releasing here would let a second
+                # session build against the same model while this one is
+                # finished and never closed.
+                abandoned = asyncio.create_task(
+                    close_abandoned_open(open_task),
+                    name=f"gander-abandoned-open-{session_id}",
+                )
+                runtime.grace_tasks.add(abandoned)
+                abandoned.add_done_callback(runtime.grace_tasks.discard)
+                LOGGER.info(
+                    "holding the model slot for %s until its abandoned open "
+                    "finishes",
+                    session_id,
+                )
                 try:
-                    await asyncio.to_thread(session.interrupt_output)
-                except RuntimeError:
-                    pass
-            await stop_speech_output_pump()
-            if outbound_task is not None:
-                outbound_task.cancel()
-                await asyncio.gather(outbound_task, return_exceptions=True)
-            await websocket_outbox.close()
-            if active is not None:
-                if runtime.sessions.get(session_id) is active:
-                    runtime.sessions.pop(session_id, None)
-                active.ended.set()
+                    await detach_connection()
+                except Exception:
+                    LOGGER.warning(
+                        "detaching the abandoned startup for %s failed",
+                        session_id,
+                        exc_info=True,
+                    )
+                return
+
+            try:
+                await detach_connection()
+                if active is not None:
+                    if runtime.sessions.get(session_id) is active:
+                        runtime.sessions.pop(session_id, None)
+                    active.ended.set()
+                if coordinator is not None:
+                    # Everything that touches the Thinker stops here. The
+                    # gateway's own teardown waits until the slot is free.
+                    await coordinator.stop_model_jobs()
+            except Exception:
+                LOGGER.warning(
+                    "teardown before slot release failed for %s",
+                    session_id,
+                    exc_info=True,
+                )
+            finally:
+                # However the block above ended - cleanly, in error, or
+                # cancelled - the Thinker is closed and the slot is freed.
+                # Neither call suspends, so nothing can land between them.
+                try:
+                    if session is not None and not session.closed:
+                        session.close()
+                finally:
+                    release_model_slot()
+
             if coordinator is not None:
-                await coordinator.close()
-            if session is not None and not session.closed:
-                # Model-owning coordinator jobs have stopped before close.
-                session.close()
-            runtime.model_lock.release()
+                # Worker/Ornith teardown is HTTP and can be slow. It runs with
+                # the slot already free, so Stop followed immediately by Start
+                # no longer reports the model busy.
+                try:
+                    await coordinator.close()
+                except Exception:
+                    LOGGER.warning(
+                        "worker gateway teardown failed for %s",
+                        session_id,
+                        exc_info=True,
+                    )
 
     return app

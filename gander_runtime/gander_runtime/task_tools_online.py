@@ -130,6 +130,7 @@ class TaskToolsRealtimeCoordinator:
         self._state_lock = threading.RLock()
         self._audio_lock = threading.Lock()
         self._closed = False
+        self._model_jobs_stopped = False
         self._audio_fd: int | None = None
         self._audio_path: Path | None = None
         if media_dir is not None:
@@ -629,11 +630,19 @@ class TaskToolsRealtimeCoordinator:
             self._delivery_outputs_pending.discard(key)
         return record
 
-    async def close(self, *, discard_state: bool = False) -> None:
+    async def stop_model_jobs(self) -> None:
+        """Stop everything that touches the Thinker session.
+
+        Split out of :meth:`close` so a caller can detach the model, close the
+        Thinker and free the single model slot without first waiting on the
+        worker gateway's network teardown. Idempotent, and safe to call before
+        :meth:`close`, which runs it again as a no-op.
+        """
+
         with self._state_lock:
-            if self._closed:
+            if self._model_jobs_stopped:
                 return
-            self._closed = True
+            self._model_jobs_stopped = True
         jobs = tuple(self._jobs)
         if self._delivery_task is not None:
             jobs = (*jobs, self._delivery_task)
@@ -647,6 +656,13 @@ class TaskToolsRealtimeCoordinator:
             self.session.set_summary_needed_callback(None)
         except Exception:
             LOGGER.debug("could not clear summary callback", exc_info=True)
+
+    async def close(self, *, discard_state: bool = False) -> None:
+        with self._state_lock:
+            if self._closed:
+                return
+            self._closed = True
+        await self.stop_model_jobs()
         with self._state_lock:
             pending_outputs = tuple(self._delivery_outputs_pending)
         for delivery_id, claim_token, delivery_attempt in pending_outputs:

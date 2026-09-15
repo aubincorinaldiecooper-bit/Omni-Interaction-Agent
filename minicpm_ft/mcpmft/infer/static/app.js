@@ -66,6 +66,11 @@ const outputAudioStateEl = document.getElementById('outputAudioState');
 let transport = null;
 let ws = null;
 let connectingWs = null;
+// Handed back at `ready`; lets a dropped socket re-bind to the same
+// Thinker instead of starting a new session.
+let duplexSessionId = null;
+let duplexResumeToken = null;
+let reconnectingDuplex = false;
 let capturePaused = false;
 let stopping = false;
 let sessionState = 'idle';
@@ -912,18 +917,46 @@ function submitFinalTurn(text, start, end) {
   return accepted;
 }
 
-async function checkRuntime() {
-  const runtime = await requestJson('health', { timeoutMs: 5000 });
-  window.GanderVideo?.applyRuntimeCapabilities(runtime.client_video);
-  contextMaxUnits = Number(runtime.context_max_units) || contextMaxUnits;
-  contextStateEl.textContent = `0 / ${contextMaxUnits}`;
-  return runtime;
+const RUNTIME_RETRY_DELAYS_MS = [500, 1500, 3000, 5000];
+
+class RuntimeBusyError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'RuntimeBusyError';
+  }
+}
+
+async function checkRuntime({ retries = RUNTIME_RETRY_DELAYS_MS.length } = {}) {
+  // /health does no model work, so a slow answer means the container is
+  // still waking. That is worth waiting for rather than failing the page.
+  let lastError = null;
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    try {
+      const runtime = await requestJson('health', { timeoutMs: 5000 });
+      window.GanderVideo?.applyRuntimeCapabilities(runtime.client_video);
+      contextMaxUnits = Number(runtime.context_max_units) || contextMaxUnits;
+      contextStateEl.textContent = `0 / ${contextMaxUnits}`;
+      return runtime;
+    } catch (error) {
+      lastError = error;
+      if (attempt === retries) break;
+      setStatus('Waking Gander');
+      addEvent(`Gander has not answered yet; retrying (${attempt + 1}/${retries})`);
+      await new Promise((resolve) => window.setTimeout(
+        resolve,
+        RUNTIME_RETRY_DELAYS_MS[Math.min(attempt, RUNTIME_RETRY_DELAYS_MS.length - 1)]
+      ));
+    }
+  }
+  throw lastError;
 }
 
 function handleServerEvent(message) {
   // Video handles its own control replies.
   if (window.GanderVideo?.handleServerEvent(message)) return;
   if (message.type === 'ready') {
+    duplexSessionId = message.session_id || duplexSessionId;
+    duplexResumeToken = message.resume_token || null;
     playbackGeneration = Number(message.generation_id) || 0;
     pendingBinaryAudio = null;
     assistantAudioFloorUnit = 0;
@@ -1091,7 +1124,21 @@ function handleServerEvent(message) {
   if (['memory.episode.done', 'break.done', 'clear_break.done', 'pong'].includes(message.type)) {
     return;
   }
-  if (message.type === 'error') throw new Error(message.message || 'Server error');
+  if (message.type === 'error') {
+    // Only an error the runtime calls fatal leaves the Thinker unusable.
+    // Everything else - a control event it did not understand, a rejected
+    // frame, a validation failure - is one line in the event log and the
+    // session carries on.
+    if (message.fatal) throw new Error(message.message || 'Server error');
+    addEvent(`Runtime: ${message.message || 'error'}`);
+    return;
+  }
+  if (message.type === 'brain.status') {
+    if (message.status === 'warming') addEvent('Brain: warming');
+    else if (message.status === 'ready') addEvent('Brain: ready');
+    else addEvent(`Brain: unavailable (${message.message || 'unknown'})`);
+    return;
+  }
 }
 
 async function requestJson(path, options = {}) {
@@ -1126,11 +1173,15 @@ async function requestJson(path, options = {}) {
   return payload;
 }
 
-function connectWebSocket() {
+function connectWebSocket({ resume = false } = {}) {
   return new Promise((resolve, reject) => {
     const socketUrl = new URL(serviceUrl('ws/duplex'));
     socketUrl.protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     socketUrl.searchParams.set('client_id', browserClientId);
+    if (resume && duplexSessionId && duplexResumeToken) {
+      socketUrl.searchParams.set('session_id', duplexSessionId);
+      socketUrl.searchParams.set('resume_token', duplexResumeToken);
+    }
     const candidate = new WebSocket(socketUrl);
     connectingWs = candidate;
     candidate.binaryType = 'arraybuffer';
@@ -1178,6 +1229,21 @@ function connectWebSocket() {
           stopAckHandle = null;
           finished = true;
           void cleanupAfterClose(false, candidate, 'Idle');
+          return;
+        }
+        if (message.type === 'error' && message.retry && !ready) {
+          // The previous session has not let go of the model yet. Not a
+          // failure - wait for the slot and try again.
+          finished = true;
+          window.clearTimeout(timer);
+          candidate.onclose = null;
+          try { candidate.close(); } catch (_) {}
+          if (connectingWs === candidate) connectingWs = null;
+          if (ws === candidate) {
+            ws = null;
+            transport = null;
+          }
+          reject(new RuntimeBusyError(message.message || 'model is busy'));
           return;
         }
         handleServerEvent(message);
@@ -1231,7 +1297,7 @@ function connectWebSocket() {
       }
       if (ws !== candidate) return;
       finished = true;
-      void cleanupAfterClose(false, candidate, 'Idle');
+      void reconnectDuplex(candidate);
     };
   });
 }
@@ -1556,7 +1622,17 @@ async function start() {
       return;
     }
     setStatus('Connecting');
-    await connectWebSocket();
+    try {
+      await connectWebSocket();
+    } catch (error) {
+      if (!(error instanceof RuntimeBusyError)) throw error;
+      addEvent('Previous session still releasing - retrying');
+      const freed = await waitForRuntimeRelease();
+      if (sessionState !== 'starting' || stopping) return;
+      if (!freed) throw error;
+      setStatus('Connecting');
+      await connectWebSocket();
+    }
     if (sessionState !== 'active' && sessionState !== 'starting') return;
     startSessionTimer();
     setSessionState('active');
@@ -1625,16 +1701,68 @@ async function reset() {
   }
 }
 
-async function waitForRuntimeRelease(timeoutMs = 5000) {
+async function waitForRuntimeRelease(timeoutMs = 60000) {
+  // The slot is freed before the slower worker teardown, so this normally
+  // returns on the first poll. When it does not, say so rather than going
+  // quiet and letting the next Start report the model busy.
   const deadline = performance.now() + timeoutMs;
+  let announced = false;
   while (performance.now() < deadline) {
     try {
       const health = await requestJson('health', { timeoutMs: 1000 });
-      if (!health.busy) return;
+      if (!health.busy) return true;
+      if (!announced) {
+        announced = true;
+        setStatus('Releasing model');
+        addEvent('Previous session is still releasing the model');
+      }
     } catch (_) {
-      return;
+      return true;
     }
     await new Promise((resolve) => window.setTimeout(resolve, 150));
+  }
+  return false;
+}
+
+const DUPLEX_RECONNECT_DELAYS_MS = [500, 1000, 2000, 5000];
+
+async function reconnectDuplex(deadSocket) {
+  // The socket went away on its own. The microphone and the screen share are
+  // both still live, and the runtime holds the session for a short window, so
+  // re-bind to it rather than tearing the page down and asking the user to
+  // start again.
+  if (ws !== deadSocket) return;
+  ws = null;
+  transport = null;
+  if (stopping || !duplexResumeToken || reconnectingDuplex) {
+    await cleanupAfterClose(false, deadSocket, 'Idle');
+    return;
+  }
+  reconnectingDuplex = true;
+  capturePaused = true;
+  setStatus('Reconnecting');
+  addEvent('Duplex connection lost; reconnecting');
+  try {
+    for (let attempt = 0; attempt < DUPLEX_RECONNECT_DELAYS_MS.length; attempt += 1) {
+      await new Promise((resolve) => window.setTimeout(
+        resolve, DUPLEX_RECONNECT_DELAYS_MS[attempt]
+      ));
+      if (stopping || sessionState === 'idle') break;
+      try {
+        await connectWebSocket({ resume: true });
+        capturePaused = false;
+        addEvent('Duplex reconnected');
+        // The share never stopped; only its channel has to be rebuilt.
+        await window.GanderVideo?.resumeTransport();
+        return;
+      } catch (error) {
+        addEvent(`Reconnect attempt ${attempt + 1} failed: ${error.message || error}`);
+      }
+    }
+    addEvent('Could not reconnect; ending the session');
+    await cleanupAfterClose(false, null, 'Idle');
+  } finally {
+    reconnectingDuplex = false;
   }
 }
 
@@ -1663,6 +1791,10 @@ async function cleanupAfterClose(forceClose, expectedWs = null, finalStatus = 'I
       }
     }
     await stopMic();
+    // Every path here is the end of the session - the reconnect loop only
+    // calls it once it has given up - so the share ends with it. The capture
+    // is held across a drop by the reconnect loop itself, which does not run
+    // this until it is finished.
     await window.GanderVideo?.stop();
     if (oldWs) await waitForRuntimeRelease();
 
@@ -1673,6 +1805,8 @@ async function cleanupAfterClose(forceClose, expectedWs = null, finalStatus = 'I
     setStatus(finalStatus, finalStatus === 'Error' ? 'error' : 'idle');
     capturePaused = false;
     stopping = false;
+    duplexSessionId = null;
+    duplexResumeToken = null;
     setSessionState('idle');
   })();
 

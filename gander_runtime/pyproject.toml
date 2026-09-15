@@ -16,6 +16,15 @@ dependencies = [
   "websockets>=12",
 ]
 
+[project.optional-dependencies]
+# Lifecycle tests stub the Thinker and the worker gateway, so they run without
+# torch or a model: `pip install -e ./gander_runtime[test] && pytest gander_runtime/tests`
+test = [
+  "pytest>=8",
+  "httpx>=0.27",
+  "pillow>=10",
+]
+
 [project.scripts]
 gander-serve = "gander_runtime.cli:main"
 
