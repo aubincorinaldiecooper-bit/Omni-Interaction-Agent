@@ -26,9 +26,25 @@ class StubThinker:
     def talker_state(self) -> dict[str, Any]:
         return {"generation_id": 0}
 
-    def close(self) -> None:
+    def close(self, *, drain_speech: bool = False) -> None:
         self.close_count += 1
         self.closed = True
+
+    # --- explicit-stop drain path ---------------------------------------
+    def flush_pending(self, *, unit_capture_start_ms=None) -> tuple:
+        return ()
+
+    def should_continue_draining(self, _steps: int) -> bool:
+        return False
+
+    def step_silence(self):
+        raise AssertionError("stub thinker never steps silence")
+
+    def should_stop_after(self, _event) -> bool:
+        return True
+
+    def wait_for_speech(self) -> None:
+        return None
 
     def interrupt_output(self) -> None:
         self.interrupted += 1
@@ -190,7 +206,9 @@ def harness(monkeypatch, tmp_path):
             params=StubParams(),
             gateway_factory=lambda _session_id: gateway,
             provider_name="stub",
-            settings=online_duplex.OnlineDuplexSettings(**settings_kwargs),
+            settings=online_duplex.OnlineDuplexSettings(
+                **{"reconnect_grace_sec": 0.3, **settings_kwargs}
+            ),
             media_dir=tmp_path / "media",
         )
         return Harness(

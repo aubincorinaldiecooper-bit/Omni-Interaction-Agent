@@ -45,6 +45,10 @@ ONLINE_TASK_PROTOCOL = "task_tools_v1"
 # Longest we wait for the talker to finish draining before cancelling it.
 # Teardown holds the single model slot, so it must be bounded.
 SPEECH_PUMP_DRAIN_TIMEOUT_SEC = 5.0
+# How long a dropped duplex socket keeps its Thinker, its coordinator and
+# the model slot, waiting for the same client to come back. The screen
+# channel stays open for this long too, so the share is not interrupted.
+RECONNECT_GRACE_SEC = 15.0
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 
@@ -61,6 +65,9 @@ class OnlineDuplexSettings:
     asr_base_url: str | None = None
     asr_timeout_sec: float = 120.0
     turn_bind_grace_sec: float = 5.0
+    # How long a dropped duplex socket keeps its Thinker, its coordinator and
+    # the model slot, waiting for the same client to come back.
+    reconnect_grace_sec: float = RECONNECT_GRACE_SEC
     # Initial media mode for each session.
     media_mode: Literal["voice", "omni", "auto"] = "voice"
     # Allow clients to switch vision through `media.mode`.
@@ -88,6 +95,14 @@ class _ActiveSession:
     video_source: str | None = None
     coordinator: Any | None = None
     ended: asyncio.Event = field(default_factory=asyncio.Event)
+    # Reconnect grace. `attached` is False while the session is parked with no
+    # socket; `resumed` fires when a client re-binds; `slot_released` makes the
+    # model slot's release idempotent across the handler and the grace timer.
+    resume_token: str = ""
+    attached: bool = True
+    stopped: bool = False
+    slot_released: bool = False
+    resumed: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 @dataclass
@@ -105,6 +120,9 @@ class _Runtime:
     first_unit_warmup_seconds: float | None = None
     model_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     sessions: dict[str, _ActiveSession] = field(default_factory=dict)
+    # Strong references to in-flight grace timers: a task nobody holds can be
+    # garbage-collected while pending, skipping its teardown entirely.
+    grace_tasks: set[asyncio.Task[None]] = field(default_factory=set)
 
 
 def _json(payload: dict[str, Any]) -> str:
@@ -739,6 +757,13 @@ def create_online_duplex_app(
             "status": "ok",
             "busy": runtime.model_lock.locked(),
             "active_sessions": list(runtime.sessions),
+            # Sessions whose socket dropped and that are inside their
+            # reconnect window: the same client can still re-bind to them.
+            "resumable_sessions": [
+                name
+                for name, active in runtime.sessions.items()
+                if not active.attached and not active.stopped
+            ],
             "session_media_modes": {
                 name: active.media_mode
                 for name, active in runtime.sessions.items()
@@ -1031,21 +1056,37 @@ def create_online_duplex_app(
             )
             await websocket.close(code=1008)
             return
-        if runtime.model_lock.locked():
-            await websocket.send_text(
-                _json(
-                    {
-                        "type": "error",
-                        "message": "model is busy with another session",
-                        "fatal": False,
-                        "retry": True,
-                    }
+        # A session whose socket dropped is held briefly. The same client,
+        # with the token it was given, re-binds to its own Thinker instead of
+        # queuing behind it for the model slot it is already holding.
+        resume_token = websocket.query_params.get("resume_token") or ""
+        parked = runtime.sessions.get(session_id)
+        resuming = bool(
+            parked is not None
+            and not parked.attached
+            and not parked.stopped
+            and resume_token
+            and parked.resume_token
+            and secrets.compare_digest(resume_token, parked.resume_token)
+        )
+        if not resuming:
+            if runtime.model_lock.locked():
+                await websocket.send_text(
+                    _json(
+                        {
+                            "type": "error",
+                            "message": "model is busy with another session",
+                            "fatal": False,
+                            "retry": True,
+                        }
+                    )
                 )
-            )
-            await websocket.close(code=1013)
-            return
+                await websocket.close(code=1013)
+                return
+            await runtime.model_lock.acquire()
 
-        await runtime.model_lock.acquire()
+        park_for_resume = False
+        slot_state = {"released": False}
         session: GanderDuplexSession | None = None
         coordinator: Any | None = None
         active: _ActiveSession | None = None
@@ -1198,6 +1239,64 @@ def create_online_duplex_app(
             # seeing and hearing must not wait on it.
             return task_coordinator
 
+        async def expire_reconnect_grace(
+            held: _ActiveSession,
+            detach: Callable[[], Awaitable[None]],
+        ) -> None:
+            """Hold a parked session, then tear it down if nobody returns.
+
+            The detach runs here rather than in the handler: a handler that
+            was cancelled cannot await anything, and the session must still be
+            parked and cleaned up.
+            """
+
+            try:
+                await detach()
+            except Exception:
+                LOGGER.warning(
+                    "detaching %s for resume failed", session_id, exc_info=True
+                )
+            try:
+                await asyncio.wait_for(
+                    held.resumed.wait(), runtime.settings.reconnect_grace_sec
+                )
+                return
+            except asyncio.TimeoutError:
+                pass
+            if held.attached:
+                # A client re-bound between the timeout and this check.
+                return
+            LOGGER.info("reconnect grace expired for %s", session_id)
+            try:
+                if runtime.sessions.get(session_id) is held:
+                    runtime.sessions.pop(session_id, None)
+                # Only now does /ws/screen learn the session is over.
+                held.ended.set()
+                if held.coordinator is not None:
+                    await held.coordinator.stop_model_jobs()
+            except Exception:
+                LOGGER.warning(
+                    "grace teardown failed for %s", session_id, exc_info=True
+                )
+            finally:
+                try:
+                    if not held.duplex.closed:
+                        held.duplex.close()
+                finally:
+                    if not held.slot_released:
+                        held.slot_released = True
+                        runtime.model_lock.release()
+                        LOGGER.info("released model slot for %s", session_id)
+            if held.coordinator is not None:
+                try:
+                    await held.coordinator.close()
+                except Exception:
+                    LOGGER.warning(
+                        "worker gateway teardown failed for %s",
+                        session_id,
+                        exc_info=True,
+                    )
+
         try:
             async def run_startup() -> None:
                 """Open the Thinker and announce readiness."""
@@ -1206,22 +1305,38 @@ def create_online_duplex_app(
                 nonlocal outbound_task, warmup_task
                 nonlocal speech_output_stop, speech_output_task
 
-                session = await _open_session(runtime)
-                if runtime.detached_talker is not None:
-                    speech_output_stop, speech_output_task = start_speech_output_pump(
-                        session
+                if resuming and parked is not None:
+                    # Same Thinker, same coordinator, same model slot. Only
+                    # the connection is new, so nothing is reloaded and the
+                    # conversation carries on where it left off.
+                    active = parked
+                    session = active.duplex
+                    coordinator = active.coordinator
+                    active.attached = True
+                    active.resumed.set()
+                    if runtime.detached_talker is not None:
+                        speech_output_stop, speech_output_task = (
+                            start_speech_output_pump(session)
+                        )
+                    LOGGER.info("duplex session resumed: %s", session_id)
+                else:
+                    session = await _open_session(runtime)
+                    if runtime.detached_talker is not None:
+                        speech_output_stop, speech_output_task = (
+                            start_speech_output_pump(session)
+                        )
+                    active = _ActiveSession(
+                        duplex=session,
+                        screen_token=secrets.token_urlsafe(32),
+                        codex_frame_gate=ScreenFrameRateGate(
+                            _codex_frame_interval_ms(runtime)
+                        ),
+                        media_mode=runtime.settings.media_mode,
+                        resume_token=secrets.token_urlsafe(32),
                     )
-                active = _ActiveSession(
-                    duplex=session,
-                    screen_token=secrets.token_urlsafe(32),
-                    codex_frame_gate=ScreenFrameRateGate(
-                        _codex_frame_interval_ms(runtime)
-                    ),
-                    media_mode=runtime.settings.media_mode,
-                )
-                runtime.sessions[session_id] = active
-                coordinator = await build_coordinator(session)
-                active.coordinator = coordinator
+                    runtime.sessions[session_id] = active
+                    coordinator = await build_coordinator(session)
+                    active.coordinator = coordinator
 
                 async def forward_tool_outputs() -> None:
                     assert coordinator is not None
@@ -1264,6 +1379,11 @@ def create_online_duplex_app(
                     {
                         "type": "ready",
                         "session_id": session_id,
+                        "resume_token": active.resume_token,
+                        "resumed": resuming,
+                        "reconnect_grace_ms": round(
+                            runtime.settings.reconnect_grace_sec * 1000
+                        ),
                         "input_sample_rate": runtime.settings.input_sample_rate,
                         "output_sample_rate": runtime.settings.output_sample_rate,
                         "chunk_ms": runtime.params.chunk_ms,
@@ -1371,9 +1491,12 @@ def create_online_duplex_app(
                                 exc_info=True,
                             )
 
-                warmup_task = asyncio.create_task(
-                    warm_back_brain(), name=f"gander-brain-warmup-{session_id}"
-                )
+                if not resuming:
+                    # A resumed session already has a warm Brain.
+                    warmup_task = asyncio.create_task(
+                        warm_back_brain(),
+                        name=f"gander-brain-warmup-{session_id}",
+                    )
 
             # Watch the socket while the session starts. A client that
             # gives up during the model open must free the Thinker slot
@@ -1424,6 +1547,7 @@ def create_online_duplex_app(
             while True:
                 message = await receive_message()
                 if message.get("type") == "websocket.disconnect":
+                    park_for_resume = True
                     return
                 if message.get("bytes") is not None:
                     audio = message["bytes"]
@@ -1497,6 +1621,9 @@ def create_online_duplex_app(
                 elif event_type == "ping":
                     await send_text({"type": "pong", "id": control.get("id")})
                 elif event_type == "stop":
+                    # An explicit Stop ends the session; it is never parked.
+                    if active is not None:
+                        active.stopped = True
                     await _drain(
                         session,
                         emit_model_event,
@@ -1689,6 +1816,8 @@ def create_online_duplex_app(
                     )
         except WebSocketDisconnect:
             LOGGER.info("duplex websocket disconnected: %s", session_id)
+            # A socket that dropped without a Stop is a candidate for resume.
+            park_for_resume = True
         except Exception as exc:
             LOGGER.exception("duplex websocket failed: %s", session_id)
             try:
@@ -1699,19 +1828,27 @@ def create_online_duplex_app(
             except (RuntimeError, WebSocketDisconnect):
                 pass
         finally:
-            slot_released = False
-
             def release_model_slot() -> None:
-                """Free the single Thinker slot, exactly once."""
+                """Free the single Thinker slot, exactly once.
 
-                nonlocal slot_released
-                if slot_released:
-                    return
-                slot_released = True
+                The guard lives on the session when there is one, so the
+                handler and the grace timer cannot both release it.
+                """
+
+                if active is not None:
+                    if active.slot_released:
+                        return
+                    active.slot_released = True
+                else:
+                    if slot_state["released"]:
+                        return
+                    slot_state["released"] = True
                 runtime.model_lock.release()
                 LOGGER.info("released model slot for %s", session_id)
 
-            try:
+            async def detach_connection() -> None:
+                """Stop everything tied to this socket, keeping the session."""
+
                 if (
                     runtime.detached_talker is not None
                     and session is not None
@@ -1729,6 +1866,39 @@ def create_online_duplex_app(
                     outbound_task.cancel()
                     await asyncio.gather(outbound_task, return_exceptions=True)
                 await websocket_outbox.close()
+
+            if (
+                park_for_resume
+                and active is not None
+                and not active.stopped
+                and runtime.sessions.get(session_id) is active
+            ):
+                # The socket dropped and nobody asked to stop. Hold the
+                # Thinker, the coordinator and the slot for a short window so
+                # the same client can come back to the same conversation, and
+                # leave /ws/screen open meanwhile so the share is untouched.
+                #
+                # Nothing here awaits. If this handler was cancelled rather
+                # than disconnected, an await would re-raise immediately and
+                # the session would be dropped instead of held; the grace
+                # timer does the waiting, and this only records the decision.
+                active.attached = False
+                active.resumed = asyncio.Event()
+                grace_task = asyncio.create_task(
+                    expire_reconnect_grace(active, detach_connection),
+                    name=f"gander-duplex-grace-{session_id}",
+                )
+                runtime.grace_tasks.add(grace_task)
+                grace_task.add_done_callback(runtime.grace_tasks.discard)
+                LOGGER.info(
+                    "holding %s for %.1fs for a reconnect",
+                    session_id,
+                    runtime.settings.reconnect_grace_sec,
+                )
+                return
+
+            try:
+                await detach_connection()
                 if active is not None:
                     if runtime.sessions.get(session_id) is active:
                         runtime.sessions.pop(session_id, None)

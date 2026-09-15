@@ -9,6 +9,7 @@ from __future__ import annotations
 import contextlib
 import json
 import threading
+import time
 
 import pytest
 from starlette.testclient import TestClient
@@ -176,6 +177,30 @@ def test_invalid_session_id_is_fatal(harness):
         assert rejected["fatal"] is True
 
 
+def _wait_resumable(client, session_id: str, timeout: float = 5.0) -> None:
+    """Wait until the server has finished parking a dropped session.
+
+    Parking happens in the handler's teardown, so a client that reconnects
+    instantly can arrive before it finishes and be told the model is busy.
+    Real clients retry on that reply; the tests wait instead.
+    """
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if session_id in client.get("/health").json()["resumable_sessions"]:
+            return
+        # Yield: polling flat out competes with the app's own event loop.
+        time.sleep(0.02)
+    raise AssertionError(f"{session_id} never became resumable")
+
+
+def _stop(ws) -> None:
+    """Send the explicit Stop control and wait for the runtime to finish."""
+
+    ws.send_text(json.dumps({"type": "stop"}))
+    _drain_until(ws, "session.done")
+
+
 def test_stop_then_immediate_connect_succeeds(harness, caplog):
     """Start straight after Stop must not report the model busy (audit 16)."""
 
@@ -184,9 +209,12 @@ def test_stop_then_immediate_connect_succeeds(harness, caplog):
     with TestClient(h.app) as client:
         with connect(client, "/ws/duplex?session_id=s1") as ws:
             _settle(ws)
-        # Second session opens on the slot the first just freed.
+            _stop(ws)
+        # Stop is explicit, so nothing is held: the slot is free right away.
+        assert client.get("/health").json()["busy"] is False
         with connect(client, "/ws/duplex?session_id=s2") as ws:
             assert _settle(ws)["session_id"] == "s2"
+            _stop(ws)
 
     releases = [
         record for record in caplog.records
@@ -203,22 +231,117 @@ def test_slot_is_released_exactly_once(harness, caplog):
     with TestClient(h.app) as client:
         with connect(client, "/ws/duplex?session_id=s1") as ws:
             _settle(ws)
+            _stop(ws)
     releases = [
         record for record in caplog.records
         if "released model slot for s1" in record.getMessage()
     ]
     assert len(releases) == 1
+
+
+def test_a_dropped_socket_is_held_then_released_once(harness, caplog):
+    """A drop is held for the grace window, then torn down once (audit 11)."""
+
+    caplog.set_level("INFO")
+    h = harness(reconnect_grace_sec=0.4)
+    with TestClient(h.app) as client:
+        with connect(client, "/ws/duplex?session_id=s1") as ws:
+            _settle(ws)
+        # Still held: the client may yet come back.
+        assert client.get("/health").json()["busy"] is True
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if not client.get("/health").json()["busy"]:
+                break
+            time.sleep(0.02)
+        assert client.get("/health").json()["busy"] is False
+
+    releases = [
+        record for record in caplog.records
+        if "released model slot for s1" in record.getMessage()
+    ]
+    assert len(releases) == 1, "the grace timer frees the slot exactly once"
     assert h.thinkers[0].close_count == 1
 
 
-def test_health_reports_the_slot_free_after_disconnect(harness):
-    """`busy` clears once the session ends, so the client can Start again."""
+def test_same_session_resume_keeps_the_thinker(harness):
+    """Coming back inside the window reuses the session (audit 11)."""
+
+    h = harness(reconnect_grace_sec=5.0)
+    with TestClient(h.app) as client:
+        with connect(client, "/ws/duplex?session_id=s1") as ws:
+            first = _settle(ws)
+            token = first["resume_token"]
+            assert first["resumed"] is False
+        _wait_resumable(client, "s1")
+        # Same id and token, inside the window: same Thinker, no new open.
+        with connect(
+            client, f"/ws/duplex?session_id=s1&resume_token={token}"
+        ) as ws:
+            again = _drain_until(ws, "ready")
+            assert again["resumed"] is True
+            assert again["session_id"] == "s1"
+            _stop(ws)
+    assert len(h.thinkers) == 1, "resume must not open a second Thinker"
+
+
+def test_resume_without_the_token_is_refused(harness):
+    """Another tab cannot adopt a held session by guessing its id."""
+
+    h = harness(reconnect_grace_sec=5.0)
+    with TestClient(h.app) as client:
+        with connect(client, "/ws/duplex?session_id=s1") as ws:
+            _settle(ws)
+        _wait_resumable(client, "s1")
+        busy = _read_rejection(client, "/ws/duplex?session_id=s1")
+        assert busy["type"] == "error"
+        assert busy["retry"] is True
+        wrong = _read_rejection(
+            client, "/ws/duplex?session_id=s1&resume_token=not-the-token"
+        )
+        assert wrong["retry"] is True
+
+
+def test_screen_channel_survives_a_duplex_drop(harness):
+    """The share is not interrupted while the duplex reconnects (audit 11)."""
+
+    h = harness(media_mode="omni", reconnect_grace_sec=5.0)
+    with TestClient(h.app) as client:
+        duplex = client.websocket_connect("/ws/duplex?session_id=s1")
+        ws = duplex.__enter__()
+        ready = _settle(ws)
+        token = ready["resume_token"]
+        with connect(
+            client,
+            f"/ws/screen?session_id=s1&token={ready['screen']['token']}",
+        ) as screen:
+            _drain_until(screen, "screen.ready")
+            # Drop the duplex socket only.
+            try:
+                duplex.__exit__(None, None, None)
+            except Exception:
+                pass
+            _wait_resumable(client, "s1")
+            # The screen channel is still up and still accepting frames.
+            screen.send_text(json.dumps(_screen_header("f1")))
+            screen.send_bytes(_jpeg())
+            assert _drain_until(screen, "screen.frame.accepted")["frame_id"] == "f1"
+            with connect(
+                client, f"/ws/duplex?session_id=s1&resume_token={token}"
+            ) as resumed:
+                assert _drain_until(resumed, "ready")["resumed"] is True
+                _stop(resumed)
+
+
+def test_health_reports_the_slot_free_after_stop(harness):
+    """`busy` clears on Stop, so the client can Start again immediately."""
 
     h = harness()
     with TestClient(h.app) as client:
         with connect(client, "/ws/duplex?session_id=s1") as ws:
             _settle(ws)
             assert client.get("/health").json()["busy"] is True
+            _stop(ws)
         assert client.get("/health").json()["busy"] is False
 
 
